@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 const MAX_CONCURRENT_UNI_STREAMS: u8 = 0;
 const KEEP_ALIVE_INTERVAL_SECS: u64 = 50;
 const MAX_IDLE_TIMEOUT_SECS: u64 = 60;
+const DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Initializes the tracing subscriber for logging.
 pub fn setup_tracing() {
@@ -97,6 +98,7 @@ pub fn create_quic_client_endpoint(
     let mut transport_config = quinn::TransportConfig::default();
     transport_config
         .keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_INTERVAL_SECS)))
+        .datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER_SIZE))
         .max_idle_timeout(Some(Duration::from_secs(MAX_IDLE_TIMEOUT_SECS).try_into()?));
     quic_client_config.transport_config(Arc::new(transport_config));
 
@@ -153,6 +155,7 @@ pub fn create_quic_server_endpoint(
         .unwrap()
         .max_concurrent_uni_streams(MAX_CONCURRENT_UNI_STREAMS.into())
         .keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_INTERVAL_SECS)))
+        .datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER_SIZE))
         .max_idle_timeout(Some(Duration::from_secs(MAX_IDLE_TIMEOUT_SECS).try_into()?));
 
     let endpoint = quinn::Endpoint::server(quinn_server_config, server_addrs)?;

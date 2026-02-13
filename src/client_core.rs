@@ -936,7 +936,7 @@ async fn handle_new_tcp_connection(
 
     for attempt in 0..=retry_config.max_retries {
         // Check for total session timeout at the beginning of each attempt.
-        if session_start.elapsed() > retry_config.total_timeout {
+        if attempt > 0 && session_start.elapsed() > retry_config.total_timeout {
             error!(
                 "Proxy session for {} timed out after {:?}. Closing connection.",
                 remote_addr, retry_config.total_timeout
@@ -1382,6 +1382,9 @@ async fn open_stream_on_best_connection(
                 info.start_time.elapsed(),
                 info.connection.rtt()
             );
+            if let Err(e) = info.connection.send_datagram(b"start_provider".to_vec().into()) {
+                warn!("Failed to send start_provider datagram: {}", e);
+            }
             Some(info.connection.clone())
         } else {
             None
