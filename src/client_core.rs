@@ -92,29 +92,29 @@
 //! is based on a trade-off between robustness, counter accuracy, error detail, performance,
 //! and code simplicity.
 
+use chrono::Utc;
+use futures::future;
+use quinn::{ReadExactError, RecvStream, SendStream};
+use rand::seq::SliceRandom;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use tokio::time::Duration;
-use quinn::{ReadExactError, RecvStream, SendStream};
-use std::net::ToSocketAddrs;
-use tracing::Instrument;
-use tracing::info_span;
-use tracing::{error, info, trace, warn};
-use std::net::SocketAddr;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
-use std::collections::{HashMap, HashSet};
-use std::time::Instant;
-use futures::future;
-use rand::seq::SliceRandom;
-use chrono::Utc;
+use tokio::time::Duration;
+use tracing::Instrument;
+use tracing::info_span;
+use tracing::{error, info, trace, warn};
 
 use crate::common;
 use crate::common::create_quic_client_endpoint;
@@ -1382,7 +1382,10 @@ async fn open_stream_on_best_connection(
                 info.start_time.elapsed(),
                 info.connection.rtt()
             );
-            if let Err(e) = info.connection.send_datagram(b"start_provider".to_vec().into()) {
+            if let Err(e) = info
+                .connection
+                .send_datagram(b"start_provider".to_vec().into())
+            {
                 warn!("Failed to send start_provider datagram: {}", e);
             }
             Some(info.connection.clone())
