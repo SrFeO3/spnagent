@@ -102,7 +102,7 @@ use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -587,6 +587,9 @@ pub async fn run_client_consumer(
         let conns_guard = connections.read().await;
         for info in conns_guard.values() {
             info.connection.set_max_concurrent_bi_streams(0u32.into());
+            if let Err(e) = info.connection.send_datagram(b"notify_shutdown".to_vec().into()) {
+                warn!("Failed to send notify_shutdown datagram: {}", e);
+            }
         }
         drop(conns_guard); // Release the read lock before waiting.
 
@@ -804,6 +807,9 @@ pub async fn run_client_provider(
         let conns_guard = connections.read().await;
         for info in conns_guard.values() {
             info.connection.set_max_concurrent_bi_streams(0u32.into());
+            if let Err(e) = info.connection.send_datagram(b"notify_shutdown".to_vec().into()) {
+                warn!("Failed to send notify_shutdown datagram: {}", e);
+            }
         }
         drop(conns_guard); // Release the read lock before waiting.
 
@@ -1382,11 +1388,11 @@ async fn open_stream_on_best_connection(
                 info.start_time.elapsed(),
                 info.connection.rtt()
             );
-            if let Err(e) = info
-                .connection
-                .send_datagram(b"start_provider".to_vec().into())
-            {
-                warn!("Failed to send start_provider datagram: {}", e);
+            if !info.provider_start_sent.load(Ordering::Relaxed) {
+                if let Err(e) = info.connection.send_datagram(b"request_provider_start".to_vec().into()) {
+                    warn!("Failed to send start_provider datagram: {}", e);
+                }
+                info.provider_start_sent.store(true, Ordering::Relaxed);
             }
             Some(info.connection.clone())
         } else {
@@ -1585,6 +1591,7 @@ async fn manage_quic_connection(
             last_activity_time: Instant::now(),
             idle_warning_logged: false,
             endpoint_type,
+            provider_start_sent: AtomicBool::new(false),
         };
 
         connections.write().await.insert(addr, info);
@@ -1708,6 +1715,8 @@ struct ConnectionInfo {
     pub idle_warning_logged: bool,
     /// The type of endpoint this connection belongs to (e.g., "provider", "consumer").
     pub endpoint_type: &'static str,
+    /// Tracks if the provider start control message has been sent for this connection.
+    pub provider_start_sent: AtomicBool,
 }
 
 /// Defines the strategy for selecting a connection from the pool.
