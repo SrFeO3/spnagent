@@ -14,33 +14,17 @@ use ep_lib::client_core;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(
-        long,
-        env = "FC_SERVER_HOSTNAME",
-        default_value = "spnhub.wgd.example.com"
-    )]
+    #[arg(long, env = "SPN_HUB_HOSTNAME")]
     fc_server_hostname: String,
-    #[arg(long, env = "FC_SERVER_PORT", default_value = "4433")]
+    #[arg(long, env = "SPN_HUB_PORT", default_value = "4433")]
     fc_server_port: u16,
-    #[arg(
-        long,
-        env = "FC_AGENT_TRUST_CERTIFICATE_ROOT",
-        default_value = "../cert_server/ca.pem"
-    )]
+    #[arg(long, env = "SPN_AGENT_TRUST_CERTIFICATE_ROOT")]
     fc_agent_turst_cert_ca: String,
-    #[arg(
-        long,
-        env = "FC_AGENT_CLIENT_CERTIFICATE",
-        default_value = "../cert_client/provider.pem"
-    )]
+    #[arg(long, env = "SPN_AGENT_CLIENT_CERTIFICATE")]
     fc_agent_client_cert: String,
-    #[arg(
-        long,
-        env = "FC_AGENT_CLIENT_CERTIFICATE_KEY",
-        default_value = "../cert_client/provider-key.pem"
-    )]
+    #[arg(long, env = "SPN_AGENT_CLIENT_CERTIFICATE_KEY")]
     fc_agent_client_cert_key: String,
-    #[arg(long, env = "FC_BIND_ADDRESS", default_value = "127.0.0.11:9001")]
+    #[arg(long, env = "FORWARD_ADDRESS")]
     fc_bind_address: String,
 }
 
