@@ -10,8 +10,12 @@ use x509_parser::oid_registry::OID_X509_COMMON_NAME;
 use x509_parser::parse_x509_certificate;
 
 const MAX_CONCURRENT_UNI_STREAMS: u8 = 0;
-const KEEP_ALIVE_INTERVAL_SECS: u64 = 50;
+const KEEP_ALIVE_INTERVAL_SECS: u64 = 5;
+const IDLE_TIMEOUT_SECS: u64 = 20;
 const DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 1024 * 1024;
+
+pub const GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+pub const PROXY_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Initializes the tracing subscriber for logging.
 pub fn setup_tracing() {
@@ -96,7 +100,7 @@ pub fn create_quic_client_endpoint(
         .max_concurrent_uni_streams(MAX_CONCURRENT_UNI_STREAMS.into())
         .keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_INTERVAL_SECS)))
         .datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER_SIZE))
-        .max_idle_timeout(None);
+        .max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into()?));
     quic_client_config.transport_config(Arc::new(transport_config));
 
     let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
