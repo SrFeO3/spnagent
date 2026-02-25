@@ -10,12 +10,13 @@ use x509_parser::oid_registry::OID_X509_COMMON_NAME;
 use x509_parser::parse_x509_certificate;
 
 const MAX_CONCURRENT_UNI_STREAMS: u8 = 0;
-const KEEP_ALIVE_INTERVAL_SECS: u64 = 5;
-const IDLE_TIMEOUT_SECS: u64 = 20;
 const DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 1024 * 1024;
 
+const KEEP_ALIVE_INTERVAL_SECS: u64 = 5;
+const IDLE_TIMEOUT_SECS: u64 = 20;
+
 pub const GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-pub const PROXY_BUFFER_SIZE: usize = 64 * 1024;
+pub const PROXY_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Initializes the tracing subscriber for logging.
 pub fn setup_tracing() {

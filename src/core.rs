@@ -1,4 +1,4 @@
-//! # Client Core Logic & Library API
+//! # Endpoint Core Logic & Library API
 //!
 //! This module implements the primary logic for the client application. It serves two purposes:
 //!
@@ -48,7 +48,7 @@
 //!     loop {
 //!         info!("Waiting to accept a server-initiated stream...");
 //!         match provider_clone.accept_stream().await {
-//!             Ok((_send, _recv)) => {
+//!             Ok((_send, _recv, _guard)) => {
 //!                 info!("Accepted a server-initiated stream!");
 //!                 // Handle the stream...
 //!             }
@@ -63,7 +63,7 @@
 //! // --- Opening Client-Initiated Streams ---
 //! // In the main task, open a client-initiated stream.
 //! info!("Opening a client-initiated stream...");
-//! let (mut send_stream, _recv_stream) = provider.open_stream().await?;
+//! let (mut send_stream, _recv_stream, _guard) = provider.open_stream().await?;
 //! send_stream.write_all(b"hello from client").await?;
 //! info!("Client-initiated stream opened and data sent.");
 //!
@@ -120,6 +120,24 @@ use crate::common::create_quic_client_endpoint;
 //== Public Library API
 //======================================================================
 
+/// RAII guard for stream counting.
+/// Decrements the count when dropped.
+///
+/// **Important:** You must keep this guard alive as long as the stream is active.
+/// Dropping it early will decrement the active stream count, potentially causing
+/// the connection to be closed prematurely during a graceful shutdown.
+#[derive(Debug)]
+pub struct StreamGuard {
+    count: Arc<AtomicUsize>,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        let prev = self.count.fetch_sub(1, Ordering::Relaxed);
+        trace!("Stream guard dropped. Active streams: {}", prev.saturating_sub(1));
+    }
+}
+
 /// Manages the lifecycle of QUIC connections and provides an interface for creating streams.
 ///
 /// This is the primary handle for using the client library. An instance is created by
@@ -134,13 +152,13 @@ pub struct SpnEndpoint {
     /// The QUIC endpoint handle, retained to ensure proper closure on drop.
     endpoint: quinn::Endpoint,
     /// Shared dictionary of active QUIC connections.
-    hub_connections: Arc<RwLock<HashMap<SocketAddr, ConnectionInfo>>>,
+    hub_connections: Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
     /// Handle to the main background maintenance task.
     hub_connections_maintenance_task: JoinHandle<()>,
     /// Handle to the background activity monitoring task.
     activity_monitor_task: JoinHandle<()>,
     /// Queue for server-initiated streams, ready to be accepted by the user.
-    accepted_stream_queue: Arc<Mutex<VecDeque<(SendStream, RecvStream)>>>,
+    accepted_stream_queue: Arc<Mutex<VecDeque<(SendStream, RecvStream, StreamGuard)>>>,
     /// Notification for when a new stream is added to the queue.
     accepted_stream_notify: Arc<Notify>,
 }
@@ -174,8 +192,9 @@ impl SpnEndpoint {
     /// and no more streams can be received.
     ///
     /// # Returns
-    /// A `Result` containing a tuple of `(SendStream, RecvStream)` on success.
-    pub async fn accept_stream(&self) -> Result<(SendStream, RecvStream), Box<dyn Error>> {
+    /// A `Result` containing a tuple of `(SendStream, RecvStream, StreamGuard)` on success.
+    /// The `StreamGuard` must be kept alive as long as the stream is in use.
+    pub async fn accept_stream(&self) -> Result<(SendStream, RecvStream, StreamGuard), Box<dyn Error>> {
         loop {
             let mut q = self.accepted_stream_queue.lock().await;
             if let Some(stream) = q.pop_front() {
@@ -199,10 +218,11 @@ impl SpnEndpoint {
     /// or if opening a new stream on the selected connection fails.
     ///
     /// # Returns
-    /// A `Result` containing a tuple of `(SendStream, RecvStream)` on success.
+    /// A `Result` containing a tuple of `(SendStream, RecvStream, StreamGuard)` on success.
+    /// The `StreamGuard` must be kept alive as long as the stream is in use.
     pub async fn open_stream(
         &self,
-    ) -> Result<(SendStream, RecvStream), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(SendStream, RecvStream, StreamGuard), Box<dyn Error + Send + Sync>> {
         info!("Requesting a new QUIC stream from the provider.");
         let stream = open_stream_on_best_connection(
             self.hub_connections.clone(),
@@ -257,13 +277,13 @@ pub async fn create_spn_endpoint(
     let endpoint = create_quic_client_endpoint(certs, key, truststore, alpn)?;
 
     // Shared state for the provider and its background tasks.
-    let hub_connections = Arc::new(RwLock::new(HashMap::<SocketAddr, ConnectionInfo>::new()));
+    let hub_connections = Arc::new(RwLock::new(HashMap::<SocketAddr, HubConnection>::new()));
     // Channel for streams accepted from the server, to be passed to the library user.
     let accepted_stream_queue = Arc::new(Mutex::new(VecDeque::new()));
     let accepted_stream_notify = Arc::new(Notify::new());
 
     // Start the activity monitor task. This task will run in the background.
-    let activity_monitor_task = tokio::spawn(monitor_approx_connection_activity(
+    let activity_monitor_task = tokio::spawn(HubConnectionManager::monitor_activity(
         hub_connections.clone(),
         Duration::from_secs(10),// Check for activity every 10 seconds.
         Duration::from_secs(30),// Log a warning if a connection is idle for more than 30 seconds.
@@ -338,10 +358,10 @@ pub async fn run_client_consumer(
         create_quic_client_endpoint(cert_path, key_path, trust_store_path, &[b"sc01-consumer"])?;
 
     // Dictionary to store active quic connections and their info, accessible from multiple tasks.
-    let hub_connections = Arc::new(RwLock::new(HashMap::<SocketAddr, ConnectionInfo>::new()));
+    let hub_connections = Arc::new(RwLock::new(HashMap::<SocketAddr, HubConnection>::new()));
 
     // Start the activity monitor task. This task will run in the background.
-    let activity_monitor_task = tokio::spawn(monitor_approx_connection_activity(
+    let activity_monitor_task = tokio::spawn(HubConnectionManager::monitor_activity(
         hub_connections.clone(),
         Duration::from_secs(10),    // Check for activity every 10 seconds.
         Duration::from_secs(30),    // Log a warning if a connection is idle for more than 30 seconds.
@@ -422,7 +442,7 @@ pub async fn run_client_consumer(
 
     // Perform graceful shutdown of QUIC connections.
     if graceful {
-        perform_graceful_shutdown(hub_connections).await;
+        HubConnectionManager::graceful_shutdown_all(hub_connections).await;
     }
 
     endpoint.close(0u32.into(), b"shutting down");
@@ -468,10 +488,10 @@ pub async fn run_client_provider(
         create_quic_client_endpoint(cert_path, key_path, trust_store_path, &[b"sc01-provider"])?;
 
     // Dictionary to store active quic connections and their info, accessible from multiple tasks.
-    let hub_connections = Arc::new(RwLock::new(HashMap::<SocketAddr, ConnectionInfo>::new()));
+    let hub_connections = Arc::new(RwLock::new(HashMap::<SocketAddr, HubConnection>::new()));
 
     // Start the activity monitor task. This task will run in the background.
-    let activity_monitor_task = tokio::spawn(monitor_approx_connection_activity(
+    let activity_monitor_task = tokio::spawn(HubConnectionManager::monitor_activity(
         hub_connections.clone(),    // Check for activity every 10 seconds.
         Duration::from_secs(10),    // Log a warning if a connection is idle for more than 30 seconds.
         Duration::from_secs(30),
@@ -516,7 +536,7 @@ pub async fn run_client_provider(
 
     // Perform graceful shutdown of QUIC connections.
     if graceful {
-        perform_graceful_shutdown(hub_connections).await;
+        HubConnectionManager::graceful_shutdown_all(hub_connections).await;
     }
 
     endpoint.close(0u32.into(), b"shutting down");
@@ -533,98 +553,6 @@ pub async fn run_client_provider(
 //== Internal Helper Functions
 //======================================================================
 
-/// Performs a graceful shutdown of all active connections.
-///
-/// This function signals all active connections to shut down and waits for them to complete
-/// or for a timeout to occur.
-async fn perform_graceful_shutdown(
-    hub_connections: Arc<RwLock<HashMap<SocketAddr, ConnectionInfo>>>,
-) {
-    info!("Initiating graceful shutdown for all active connections...");
-    let conns_guard = hub_connections.read().await;
-    for info in conns_guard.values() {
-        if info.hub_status.compare_exchange(HubStatus::Active as u8, HubStatus::ShuttingDown as u8, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-            info.shutdown_initiator.store(ShutdownInitiator::Endpoint as u8, Ordering::Relaxed);
-            info.shutdown_signal.notify_one();
-        }
-    }
-    drop(conns_guard);
-
-    let timeout = Duration::from_secs(60);
-    let start = Instant::now();
-    loop {
-        if hub_connections.read().await.is_empty() {
-            info!("All connections shut down gracefully.");
-            break;
-        }
-        if start.elapsed() > timeout {
-            let guard = hub_connections.read().await;
-            warn!(
-                "Timeout waiting for connections to shut down. Remaining connections: {} (addrs: {:?})",
-                guard.len(),
-                guard.keys().collect::<Vec<_>>()
-            );
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
-/// A background task that periodically checks all active connections for data activity.
-///
-/// This function implements the "periodic polling" approach. It does not interfere with
-/// the data path, making it very low-impact. It wakes up at a regular interval,
-/// checks the `quinn::ConnectionStats` for each connection, and updates an
-/// "last activity" timestamp if any data has been transferred.
-///
-/// # Arguments
-/// * `hub_connections`: A shared reference to the map of active connections.
-/// * `check_interval`: How often to poll for activity.
-/// * `idle_threshold`: The duration after which a connection is considered idle, triggering a log message.
-async fn monitor_approx_connection_activity(
-    hub_connections: Arc<RwLock<HashMap<SocketAddr, ConnectionInfo>>>,
-    check_interval: Duration,
-    idle_threshold: Duration,
-) {
-    let mut interval = tokio::time::interval(check_interval);
-    info!(
-        "Starting connection activity monitor. Check interval: {:?}, Idle threshold: {:?}",
-        check_interval, idle_threshold
-    );
-
-    loop {
-        interval.tick().await;
-        let mut conns_guard = hub_connections.write().await;
-
-        for (addr, info) in conns_guard.iter_mut() {
-            let current_stats = info.connection.stats();
-
-            // Check if any data has been sent or received since the last check.
-            if current_stats.udp_tx.bytes > info.last_stats.udp_tx.bytes
-                || current_stats.udp_rx.bytes > info.last_stats.udp_rx.bytes
-            {
-                // Activity detected, update the timestamp and reset the warning flag.
-                trace!("Activity detected on connection to {}", addr);
-                info.last_activity_time = Instant::now();
-                info.idle_warning_logged = false;
-            } else {
-                // No activity, check if the idle threshold has been exceeded.
-                let idle_duration = info.last_activity_time.elapsed();
-                if idle_duration > idle_threshold && !info.idle_warning_logged {
-                    warn!(
-                        "Connection to {} has been idle for approximately {:?}.",
-                        addr, idle_duration
-                    );
-                    info.idle_warning_logged = true; // Log only once per idle period.
-                }
-            }
-
-            // Update the stats for the next comparison.
-            info.last_stats = current_stats;
-        }
-    }
-}
-
 /// Handles an incoming TCP connection by proxying it over a QUIC stream with retry logic.
 ///
 /// This function maintains the TCP connection while attempting to establish and
@@ -633,7 +561,7 @@ async fn monitor_approx_connection_activity(
 async fn handle_new_tcp_connection(
     tcp_stream: TcpStream,
     remote_addr: SocketAddr,
-    hub_connections: Arc<RwLock<HashMap<SocketAddr, ConnectionInfo>>>,
+    hub_connections: Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
     strategy: ConnectionSelectionStrategy,
     retry_config: ProxyRetryConfig,
 ) {
@@ -690,7 +618,7 @@ async fn handle_new_tcp_connection(
             }
         };
 
-        let (quic_send, quic_recv) = quic_streams;
+        let (quic_send, quic_recv, _guard) = quic_streams;
         match copy_bidirectional_with_status(
             &mut tcp_read,
             &mut tcp_write,
@@ -819,7 +747,7 @@ async fn copy_bidirectional_with_status(
     let tcp_to_quic = async {
         let mut tcp_bytes_read = 0;
         let mut quic_bytes_written = 0;
-        let mut buf = [0u8; common::PROXY_BUFFER_SIZE]; // Use stack-allocated buffer for performance
+        let mut buf = vec![0u8; common::PROXY_BUFFER_SIZE];
 
         loop {
             let n = match tcp_read.read(&mut buf).await {
@@ -849,7 +777,7 @@ async fn copy_bidirectional_with_status(
     let quic_to_tcp = async {
         let mut quic_bytes_read = 0;
         let mut tcp_bytes_written = 0;
-        let mut buf = [0u8; common::PROXY_BUFFER_SIZE]; // Use stack-allocated buffer for performance
+        let mut buf = vec![0u8; common::PROXY_BUFFER_SIZE];
 
         loop {
             let n = match quic_recv.read(&mut buf).await {
@@ -867,6 +795,12 @@ async fn copy_bidirectional_with_status(
             }
             tcp_bytes_written += n as u64;
         }
+
+        // Propagate FIN to TCP to support half-close correctly.
+        if let Err(e) = tcp_write.shutdown().await {
+            return Err(CopyError::Tcp(e));
+        }
+
         Ok((quic_bytes_read, tcp_bytes_written))
     };
 
@@ -928,18 +862,9 @@ async fn copy_bidirectional_with_status(
 async fn handle_new_quic_stream_for_provider(
     mut send_stream: SendStream,
     mut recv_stream: RecvStream,
-    stream_count: Arc<AtomicUsize>,
+    _guard: StreamGuard,
     tcp_bind_address: String,
 ) {
-    // RAII guard to ensure the stream counter is decremented when the handler finishes.
-    struct StreamCounterGuard(Arc<AtomicUsize>);
-    impl Drop for StreamCounterGuard {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::Relaxed);
-            info!("Stream handler finished, decrementing stream count.");
-        }
-    }
-    let _guard = StreamCounterGuard(stream_count);
     info!(
         "Handling a new server-initiated QUIC stream, proxying to local TCP: {}",
         tcp_bind_address
@@ -1038,7 +963,7 @@ trait StreamHandler: Send + Sync + Clone + 'static {
         &self,
         send: quinn::SendStream,
         recv: quinn::RecvStream,
-        count: Arc<AtomicUsize>,
+        guard: StreamGuard,
     ) -> impl Future<Output = ()> + Send;
 }
 
@@ -1050,11 +975,11 @@ impl StreamHandler for ConsumerStreamHandler {
         &self,
         _send: quinn::SendStream,
         _recv: quinn::RecvStream,
-        count: Arc<AtomicUsize>,
+        _guard: StreamGuard,
     ) -> impl Future<Output = ()> + Send {
         async move {
             warn!("Consumer received an unexpected server-initiated stream. Dropping it.");
-            count.fetch_sub(1, Ordering::Relaxed);
+            // guard is dropped here, decrementing count.
         }
     }
 }
@@ -1069,11 +994,11 @@ impl StreamHandler for ProviderStreamHandler {
         &self,
         send: quinn::SendStream,
         recv: quinn::RecvStream,
-        count: Arc<AtomicUsize>,
+        guard: StreamGuard,
     ) -> impl Future<Output = ()> + Send {
         let addr = self.tcp_bind_address.clone();
         async move {
-            tokio::spawn(handle_new_quic_stream_for_provider(send, recv, count, addr));
+            tokio::spawn(handle_new_quic_stream_for_provider(send, recv, guard, addr));
         }
     }
 }
@@ -1081,7 +1006,7 @@ impl StreamHandler for ProviderStreamHandler {
 /// Handler for Library usage (queues streams for the user).
 #[derive(Clone)]
 struct LibraryStreamHandler {
-    queue: Arc<Mutex<VecDeque<(quinn::SendStream, quinn::RecvStream)>>>,
+    queue: Arc<Mutex<VecDeque<(quinn::SendStream, quinn::RecvStream, StreamGuard)>>>,
     notify: Arc<Notify>,
     capacity: usize,
 }
@@ -1090,7 +1015,7 @@ impl StreamHandler for LibraryStreamHandler {
         &self,
         send: quinn::SendStream,
         recv: quinn::RecvStream,
-        count: Arc<AtomicUsize>,
+        guard: StreamGuard,
     ) -> impl Future<Output = ()> + Send {
         let queue = self.queue.clone();
         let notify = self.notify.clone();
@@ -1098,11 +1023,11 @@ impl StreamHandler for LibraryStreamHandler {
         async move {
             let mut q = queue.lock().await;
             if q.len() < capacity {
-                q.push_back((send, recv));
+                q.push_back((send, recv, guard));
                 notify.notify_one();
             } else {
                 info!("Could not forward stream to application: queue is full. Stream will be dropped.");
-                count.fetch_sub(1, Ordering::Relaxed);
+                // guard is dropped here, decrementing count.
             }
         }
     }
@@ -1114,7 +1039,7 @@ fn spawn_connection_maintenance_task<S: StreamHandler>(
     server_port: u16,
     endpoint: quinn::Endpoint,
     stream_handler: S,
-    hub_connections: Arc<RwLock<HashMap<SocketAddr, ConnectionInfo>>>,
+    hub_connections: Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
     endpoint_type: &'static str,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1123,7 +1048,7 @@ fn spawn_connection_maintenance_task<S: StreamHandler>(
 
         loop {
             interval.tick().await;
-            reconcile_quic_connections_to_dns(
+            HubConnectionManager::reconcile_to_dns(
                 &server_name,
                 server_port,
                 &endpoint,
@@ -1140,9 +1065,9 @@ fn spawn_connection_maintenance_task<S: StreamHandler>(
 /// Selects the best available QUIC connection based on a given strategy and opens a new stream.
 /// This function contains the logic previously in `handle_new_tcp_connection`.
 async fn open_stream_on_best_connection(
-    hub_connections: Arc<RwLock<HashMap<SocketAddr, ConnectionInfo>>>,
+    hub_connections: Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
     strategy: ConnectionSelectionStrategy,
-) -> Result<(SendStream, RecvStream), Box<dyn Error + Send + Sync>> {
+) -> Result<(SendStream, RecvStream, StreamGuard), Box<dyn Error + Send + Sync>> {
     // Wait for at least one connection to be available, with a timeout.
     const CONNECTION_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
     const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -1213,13 +1138,13 @@ async fn open_stream_on_best_connection(
                 }
                 info.provider_start_sent.store(true, Ordering::Relaxed);
             }
-            Some(info.connection.clone())
+            Some((info.connection.clone(), info.stream_count.clone()))
         } else {
             None
         }
     };
 
-    if let Some(connection) = selected_connection {
+    if let Some((connection, stream_count)) = selected_connection {
         // Note on Race Condition:
         // The connection status might transition to `ShuttingDown` (e.g., by another task handling
         // a shutdown signal) after we selected it above but before we open the stream here.
@@ -1228,8 +1153,10 @@ async fn open_stream_on_best_connection(
         info!("Attempting to open a bidirectional stream on the selected connection.");
         match connection.open_bi().await {
             Ok((send, recv)) => {
+                stream_count.fetch_add(1, Ordering::Relaxed);
+                let guard = StreamGuard { count: stream_count };
                 info!("Successfully opened a bidirectional stream.");
-                Ok((send, recv))
+                Ok((send, recv, guard))
             }
             Err(e) => {
                 error!("Failed to open a stream on the selected connection: {}", e);
@@ -1242,464 +1169,6 @@ async fn open_stream_on_best_connection(
                 .into(),
         )
     }
-}
-
-/// The central orchestrator for ensuring QUIC connections match DNS records.
-///
-/// This function acts as a "reconciler". Its primary goal is to ensure that the
-/// application's actual state (the set of active `manage_single_quic_connection` tasks)
-/// matches the desired state (the set of IP addresses from the latest DNS query).
-///
-/// It is safe to run repeatedly. If interrupted, the next execution will simply
-/// re-evaluate the state and take necessary actions to converge.
-///
-/// ### Key Steps
-/// 1.  **Get Desired State (from DNS)**: Resolves the server's DNS name to get the
-///     set of IP addresses we *should* be connected to.
-/// 2.  **Reconcile Tasks**: Compares currently running connection tasks with DNS results.
-///     - It **stops** tasks for IPs that are no longer in DNS or have already finished.
-///     - It **starts** new `manage_single_quic_connection` tasks for IPs that have appeared
-///       in DNS but don't have a running task.
-///
-/// Note: Unlike the previous design, this function does **not** reconcile the shared
-/// `connections` dictionary. That responsibility is now fully delegated to the
-/// `manage_single_quic_connection` tasks themselves, simplifying the logic here.
-async fn reconcile_quic_connections_to_dns<S: StreamHandler>(
-    server_name: &str,
-    server_port: u16,
-    endpoint: &quinn::Endpoint,
-    stream_handler: S,
-    maintenance_task_handles: &mut HashMap<SocketAddr, tokio::task::JoinHandle<()>>,
-    hub_connections: &Arc<RwLock<HashMap<SocketAddr, ConnectionInfo>>>,
-    endpoint_type: &'static str,
-) {
-    info!("Reconciling QUIC connections to DNS for '{}'", server_name);
-
-    // Step 1: Define the "Desired State" by resolving the DNS name.
-    let server_name_owned = server_name.to_string();
-    let latest_addrs = match tokio::task::spawn_blocking(move || {
-        (server_name_owned.as_str(), server_port).to_socket_addrs()
-    })
-    .await
-    {
-        Ok(Ok(addrs)) => addrs.collect::<HashSet<SocketAddr>>(),
-        Ok(Err(e)) => {
-            error!(
-                "DNS resolution failed for '{}': {}. Keeping existing connections.",
-                server_name, e
-            );
-            maintenance_task_handles.keys().cloned().collect()
-        }
-        Err(e) => {
-            error!(
-                "DNS resolution task panicked: {}. Keeping existing connections.",
-                e
-            );
-            maintenance_task_handles.keys().cloned().collect()
-        }
-    };
-    info!("Resolved '{}' to: {:?}", server_name, latest_addrs);
-
-    // If DNS resolution was successful but returned an empty list, and we have active connections,
-    // treat it as a temporary failure to prevent mass disconnection.
-    if latest_addrs.is_empty() && !maintenance_task_handles.is_empty() {
-        warn!(
-            "DNS resolution for '{}' returned an empty list, but active connections exist. Assuming temporary failure and keeping existing connections.",
-            server_name
-        );
-        return;
-    }
-
-    // 1. Identify IPs to be removed (no longer in DNS) and signal them to shut down.
-    let mut to_remove = Vec::new();
-    for addr in maintenance_task_handles.keys() {
-        if !latest_addrs.contains(addr) {
-            to_remove.push(*addr);
-        }
-    }
-
-    if !to_remove.is_empty() {
-        let conns_guard = hub_connections.read().await;
-        for addr in to_remove {
-            if let Some(info) = conns_guard.get(&addr) {
-                // Only send shutdown if it's currently active. Avoids sending multiple signals.
-                if info.hub_status.compare_exchange(HubStatus::Active as u8, HubStatus::ShuttingDown as u8, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                    info!("Address {} is no longer in DNS records, initiating graceful shutdown.", addr);
-                    info.shutdown_initiator.store(ShutdownInitiator::Endpoint as u8, Ordering::Relaxed);
-                    info.shutdown_signal.notify_one();
-                }
-            }
-        }
-    }
-
-    // 2. Clean up any maintenance tasks that have fully completed (either by error or shutdown).
-    maintenance_task_handles.retain(|addr, handle| {
-        if handle.is_finished() {
-            info!("Connection task for {} has finished. It will be removed.", addr);
-            false
-        } else {
-            true
-        }
-    });
-
-    // 2.5. Check for tasks that are in DNS but are ShuttingDown.
-    // If found, remove them from maintenance_task_handles (detach them) so they are recreated in step 3.
-    let conns_guard = hub_connections.read().await;
-    let mut shutting_down_addrs = Vec::new();
-    for addr in maintenance_task_handles.keys() {
-        if latest_addrs.contains(addr) {
-             if let Some(info) = conns_guard.get(addr) {
-                 if info.hub_status.load(Ordering::Relaxed) == HubStatus::ShuttingDown as u8 {
-                     shutting_down_addrs.push(*addr);
-                 }
-             }
-        }
-    }
-    drop(conns_guard);
-
-    for addr in shutting_down_addrs {
-        info!("Connection to {} is shutting down but is in DNS. Detaching old task and starting a new one.", addr);
-        maintenance_task_handles.remove(&addr); // Detach. The task continues to run/drain until finished.
-    }
-
-    // 3. Start new tasks for IPs that are in DNS but have no running task.
-    let current_task_addrs: HashSet<_> = maintenance_task_handles.keys().cloned().collect();
-    for addr_to_add in latest_addrs.difference(&current_task_addrs) {
-        info!("New address {} found in DNS, starting a new connection manager task.", addr_to_add);
-        let endpoint_clone = endpoint.clone();
-        let server_name_clone = server_name.to_string();
-        let stream_handler_clone = stream_handler.clone();
-        let hub_connections_clone = hub_connections.clone();
-        let handle = tokio::spawn(manage_quic_connection(
-            endpoint_clone,
-            *addr_to_add,
-            server_name_clone,
-            stream_handler_clone,
-            hub_connections_clone,
-            endpoint_type,
-        ));
-        maintenance_task_handles.insert(*addr_to_add, handle);
-    }
-
-    info!(
-        "Reconciliation complete. {} active QUIC connection tasks.",
-        maintenance_task_handles.len(),
-    );
-}
-
-/// Manages the entire lifecycle of a single QUIC connection in an autonomous task.
-///
-/// This function is the "worker" spawned by the `reconcile_quic_connections_to_dns` "manager".
-/// It embodies a "self-registration and self-cleanup" pattern, making it highly autonomous.
-///
-/// ### Lifecycle & Responsibilities:
-/// 1.  **Connect**: Attempts to establish a QUIC connection to the given `addr`. If it fails,
-///     the task simply terminates.
-/// 2.  **Register**: Upon successful connection, it creates a `ConnectionInfo` struct and
-///     **registers itself** in the shared `connections` map. This includes a `shutdown_tx`
-///     channel specific to this task.
-/// 3.  **Work & Monitor**: It enters a `tokio::select!` loop to concurrently:
-///     -   Accept incoming bidirectional streams from the server and forward them to the
-///         central `stream_tx` channel.
-///     -   Listen for a shutdown command on its `shutdown_rx` channel to begin graceful shutdown.
-///     -   Watch for the connection to be closed unexpectedly (`connection.closed()`).
-/// 4.  **Cleanup (RAII-like)**: Once the connection is closed (either gracefully or due to
-///     an error), the `select!` loop terminates. The function then proceeds to its final
-///     step: it **removes its own entry** from the shared `connections` map.
-/// 5.  **Terminate**: After cleanup, the task finishes its execution.
-///
-/// This design eliminates the need for a separate `conn_tx` channel and external logic
-/// to manage the `connections` map, significantly simplifying the overall architecture.
-async fn manage_quic_connection<S: StreamHandler>(
-    endpoint: quinn::Endpoint,
-    addr: SocketAddr,
-    server_name: String,
-    stream_handler: S,
-    hub_connections: Arc<RwLock<HashMap<SocketAddr, ConnectionInfo>>>,
-    endpoint_type: &'static str,
-) {
-    let span = info_span!("manage_quic_connection", remote_addr = %addr);
-    let start_time_utc = Utc::now();
-    async move {
-        // --- 1. Connect ---
-        info!("Attempting to establish QUIC connection...");
-        let connection = match endpoint.connect(addr, &server_name) {
-            Ok(connecting) => match connecting.await {
-                Ok(conn) => {
-                    info!("Connection handshake successful.");
-                    conn
-                }
-                Err(e) => {
-                    // Log the specific connection error. The reconciler will eventually try again.
-                    error!("Connection failed during handshake: {}", e);
-                    return; // End of this task.
-                }
-            },
-            Err(e) => {
-                error!("Failed to initiate connection: {}", e);
-                return; // End of this task
-            }
-        };
-
-        // Extract certificate information for logging and ID compliance.
-        let (peer_cn, _) = common::check_and_get_info_connection(connection.clone()).await;
-
-        // --- 2. Register ---
-        // This task is now responsible for this connection, so add it to the shared map.
-        let stream_count = Arc::new(AtomicUsize::new(0));
-        let hub_status = Arc::new(AtomicU8::new(HubStatus::Active as u8));
-        let shutdown_signal = Arc::new(Notify::new());
-        let shutdown_initiator = Arc::new(AtomicU8::new(ShutdownInitiator::None as u8));
-        let connection_id = connection.stable_id();
-
-        // Start the datagram handler to listen for control messages (e.g., shutdown notifications).
-        // This handles shutdown requests *initiated by the Hub*.
-        let datagram_handler =
-            spawn_control_datagram_handler(connection.clone(), hub_status.clone(), shutdown_signal.clone(), shutdown_initiator.clone(), addr);
-
-        let info = ConnectionInfo {
-            connection: connection.clone(),
-            dest_addr: addr,
-            start_time: Instant::now(),
-            stream_count: stream_count.clone(),
-            last_stats: connection.stats(),
-            last_activity_time: Instant::now(),
-            idle_warning_logged: false,
-            endpoint_type,
-            provider_start_sent: AtomicBool::new(false),
-            hub_status: hub_status.clone(),
-            shutdown_signal: shutdown_signal.clone(),
-            shutdown_initiator: shutdown_initiator.clone(),
-            peer_cn: peer_cn.clone(),
-        };
-
-        hub_connections.write().await.insert(addr, info);
-        info!(
-            message = "QUIC connection started",
-            startAt = %start_time_utc.to_rfc3339(),
-            quic_connection_id = %connection_id,
-            spnEndPoint = ?peer_cn,
-            endpoint_type = endpoint_type,
-            server_ip = %addr,
-        );
-
-        // RAII Guard to ensure cleanup if the task is aborted (e.g. by DNS reconciliation).
-        struct ConnectionCleanupGuard {
-            addr: SocketAddr,
-            connection_id: usize,
-            hub_connections: Arc<RwLock<HashMap<SocketAddr, ConnectionInfo>>>,
-            start_time_utc: chrono::DateTime<Utc>,
-            datagram_handler: JoinHandle<()>,
-        }
-        impl Drop for ConnectionCleanupGuard {
-            fn drop(&mut self) {
-                self.datagram_handler.abort();
-                let addr = self.addr;
-                let connection_id = self.connection_id;
-                let hub_connections = self.hub_connections.clone();
-                let start_time_utc = self.start_time_utc;
-                tokio::spawn(async move {
-                    // Attempt to remove. If successful, it means the task was aborted/cancelled
-                    // before the normal cleanup could run.
-                    let mut guard = hub_connections.write().await;
-                    if let std::collections::hash_map::Entry::Occupied(entry) = guard.entry(addr) {
-                        // Only remove if the connection ID matches. This prevents removing a NEW connection
-                        // that might have replaced us if we are a detached draining task.
-                        if entry.get().connection.stable_id() == connection_id {
-                            let removed_info = entry.remove();
-                            info!(
-                                message = "QUIC connection task aborted",
-                                startAt = %start_time_utc.to_rfc3339(),
-                                quic_connection_id = %removed_info.connection.stable_id(),
-                                spnEndPoint = ?removed_info.peer_cn,
-                                endpoint_type = removed_info.endpoint_type,
-                                server_ip = %removed_info.dest_addr,
-                                duration_secs = removed_info.start_time.elapsed().as_secs_f64(),
-                                reason = "Task Aborted",
-                                terminateReason = "shutdown",
-                                total_quic_streams = removed_info.stream_count.load(Ordering::Relaxed),
-                            );
-                            // Ensure the connection is closed
-                            removed_info.connection.close(0u32.into(), b"Task Aborted");
-                        }
-                    }
-                });
-            }
-        }
-        let _guard = ConnectionCleanupGuard {
-            addr,
-            connection_id,
-            hub_connections: hub_connections.clone(),
-            start_time_utc,
-            datagram_handler,
-        };
-
-        // --- 3. Work (Accept Streams) & Monitor (Watch for Close) ---
-        let reason = tokio::select! {
-            // Branch A: Connection closes unexpectedly (by peer or network error).
-            reason = connection.closed() => {
-                info!("Connection to {} closed by peer or due to error.", addr);
-                reason
-            },
-
-            // Branch B: Graceful shutdown is requested by us (via DNS change or signal).
-            _ = shutdown_signal.notified() => {
-                let initiator_val = shutdown_initiator.load(Ordering::Relaxed);
-                let initiator_str = match initiator_val {
-                    1 => "Hub instruction",
-                    2 => "Endpoint termination",
-                    _ => "Unknown",
-                };
-                info!("Graceful shutdown triggered by {} for connection to {}. Draining...", initiator_str, addr);
-
-                // The caller should have already set the status, but we ensure it.
-                hub_status.store(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
-
-                // Notify the peer hub to stop sending new streams.
-                connection.set_max_concurrent_bi_streams(0u32.into());
-
-                // Send notify_shutdown datagram
-                if let Err(e) = connection.send_datagram(b"notify_shutdown".to_vec().into()) {
-                    warn!("Failed to send notify_shutdown datagram to {}: {}", addr, e);
-                }
-
-                // Wait for active streams to drain or for a timeout.
-                let timeout = common::GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT;
-                let start = Instant::now();
-                let mut forced = false;
-                loop {
-                    let count = stream_count.load(Ordering::Relaxed);
-                    if count == 0 {
-                        info!("Connection {} drained successfully.", addr);
-                        break;
-                    }
-                    if start.elapsed() > timeout {
-                        warn!("Connection {} drain timed out with {} active streams. Forcing close.", addr, count);
-                        forced = true;
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-
-                // Close the connection from our side.
-                let reason_bytes = if forced {
-                    b"Graceful Shutdown: Forced by Timeout".as_slice()
-                } else {
-                    b"Graceful Shutdown: Completed".as_slice()
-                };
-                connection.close(0u32.into(), reason_bytes);
-
-                // Wait for the connection to fully close and get the final reason.
-                connection.closed().await
-            },
-
-
-            // Branch C: Normal work (accepting server-initiated streams).
-            _ = async {
-                loop {
-                    match connection.accept_bi().await {
-                        Ok(streams) => {
-                            stream_count.fetch_add(1, Ordering::Relaxed);
-                            trace!("Accepted a new bidirectional stream. Active streams: {}", stream_count.load(Ordering::Relaxed));
-                            stream_handler.handle_stream(streams.0, streams.1, stream_count.clone()).await;
-                        }
-                        Err(e) => {
-                            // This error typically occurs when the connection is closing.
-                            trace!("Stream listener for {} is stopping: {}", addr, e);
-                            break;
-                        }
-                    }
-                }
-            } => {
-                // The stream acceptance loop broke. We assume the connection is closing and wait for the official reason.
-                connection.closed().await
-            }
-        };
-
-        // --- 4. Cleanup ---
-        // The connection has closed. This task's final responsibility is to remove itself from the shared map.
-        let mut removed_info = None;
-        {
-            let mut guard = hub_connections.write().await;
-            if let std::collections::hash_map::Entry::Occupied(entry) = guard.entry(addr) {
-                if entry.get().connection.stable_id() == connection_id {
-                    removed_info = Some(entry.remove());
-                }
-            }
-        }
-
-        if let Some(removed_info) = removed_info {
-            let terminate_reason = match &reason {
-                quinn::ConnectionError::LocallyClosed => "shutdown",
-                quinn::ConnectionError::ConnectionClosed(_)
-                | quinn::ConnectionError::ApplicationClosed(_)
-                | quinn::ConnectionError::Reset => "terminatedByPeer",
-                quinn::ConnectionError::VersionMismatch
-               // | quinn::ConnectionError::FormatError(_) 要確認！！！
-                | quinn::ConnectionError::TransportError(_)
-                | quinn::ConnectionError::TimedOut
-                | quinn::ConnectionError::CidsExhausted => "error",
-            };
-
-            info!(
-                message = "QUIC connection ended",
-                startAt = %start_time_utc.to_rfc3339(),
-                quic_connection_id = %removed_info.connection.stable_id(),
-                spnEndPoint = ?removed_info.peer_cn,
-                endpoint_type = removed_info.endpoint_type,
-                server_ip = %removed_info.dest_addr,
-                duration_secs = removed_info.start_time.elapsed().as_secs_f64(),
-                reason = %reason,
-                terminateReason = terminate_reason,
-                total_quic_streams = removed_info.stream_count.load(Ordering::Relaxed),
-            );
-        } else {
-            // This case is unlikely but possible if another part of the system (e.g., a forceful shutdown)
-            // clears the map.
-            warn!("Connection info for {} was already removed during cleanup.", addr);
-        }
-
-        // --- 5. Terminate ---
-        // The task's work is done.
-        info!("Task finished.");
-    }
-    .instrument(span)
-    .await
-}
-
-/// Spawns a background task to handle incoming datagrams (control messages) for a connection.
-///
-/// This handler listens for specific control messages, such as "notify_shutdown",
-/// and updates the connection state accordingly (e.g., setting the `draining` flag).
-fn spawn_control_datagram_handler(
-    connection: quinn::Connection,
-    hub_status: Arc<AtomicU8>,
-    shutdown_signal: Arc<Notify>,
-    shutdown_initiator: Arc<AtomicU8>,
-    addr: SocketAddr,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            match connection.read_datagram().await {
-                Ok(bytes) => {
-                    if bytes.as_ref() == b"notify_shutdown" {
-                        info!(
-                            "Received notify_shutdown from Hub ({}). Marking connection as ShuttingDown.",
-                            addr
-                        );
-                        hub_status.store(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
-                        shutdown_initiator.store(ShutdownInitiator::Hub as u8, Ordering::Relaxed);
-                        // Trigger the main task's graceful shutdown logic via the shared channel.
-                        shutdown_signal.notify_one();
-                    }
-                }
-                Err(_) => {
-                    // Connection closed or error, stop the handler.
-                    break;
-                }
-            }
-        }
-    })
 }
 
 /// Configuration for a client application instance.
@@ -1723,9 +1192,9 @@ pub struct AppConfig {
     pub server_port: u16,
 }
 
-/// Holds information about an active connection.
+/// Holds the state of a single QUIC connection to a Hub.
 #[derive(Debug)]
-struct ConnectionInfo {
+struct HubConnection {
     /// The QUIC connection handle.
     pub connection: quinn::Connection,
     /// The destination address of the connection.
@@ -1734,12 +1203,8 @@ struct ConnectionInfo {
     pub start_time: Instant,
     /// The number of active streams on this connection.
     pub stream_count: Arc<AtomicUsize>,
-    /// The last known statistics for this connection, used for idle detection.
-    pub last_stats: quinn::ConnectionStats,
-    /// The approximate time of the last detected data transfer on this connection.
-    pub last_activity_time: Instant,
-    /// A flag to prevent spamming idle warnings. True if a warning has already been logged.
-    pub idle_warning_logged: bool,
+    /// Tracks activity statistics with internal mutability to avoid global write locks.
+    pub activity_tracker: std::sync::Mutex<ActivityTracker>,
     /// The type of endpoint this connection belongs to (e.g., "provider", "consumer").
     pub endpoint_type: &'static str,
     /// Tracks if the provider start control message has been sent for this connection.
@@ -1754,6 +1219,17 @@ struct ConnectionInfo {
     pub peer_cn: Option<String>,
 }
 
+/// Mutable state for tracking connection activity.
+#[derive(Debug)]
+struct ActivityTracker {
+    /// The last known statistics for this connection, used for idle detection.
+    pub last_stats: quinn::ConnectionStats,
+    /// The approximate time of the last detected data transfer on this connection.
+    pub last_activity_time: Instant,
+    /// A flag to prevent spamming idle warnings. True if a warning has already been logged.
+    pub idle_warning_logged: bool,
+}
+
 /// Represents the perceived operational status of a peer Hub.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -1762,6 +1238,8 @@ enum HubStatus {
     Active = 0,
     /// The hub is shutting down and will not accept new endpoint streams.
     ShuttingDown = 1,
+    /// The hub has designated this connection as standby.
+    StandBy = 2,
 }
 
 /// Represents who initiated the shutdown.
@@ -1771,6 +1249,547 @@ enum ShutdownInitiator {
     None = 0,
     Hub = 1,
     Endpoint = 2,
+}
+
+/// Namespace for functions that manage the collection of HubConnections.
+struct HubConnectionManager;
+
+impl HubConnectionManager {
+    /// Performs a graceful shutdown of all active connections.
+    ///
+    /// This function signals all active connections to shut down and waits for them to complete
+    /// or for a timeout to occur.
+    async fn graceful_shutdown_all(
+        hub_connections: Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
+    ) {
+        info!("Initiating graceful shutdown for all active connections...");
+        let conns_guard = hub_connections.read().await;
+        for info in conns_guard.values() {
+            let prev_status = info.hub_status.swap(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
+            if prev_status != HubStatus::ShuttingDown as u8 {
+                info.shutdown_initiator.store(ShutdownInitiator::Endpoint as u8, Ordering::Relaxed);
+                info.shutdown_signal.notify_one();
+            }
+        }
+        drop(conns_guard);
+
+        let timeout = Duration::from_secs(60);
+        let start = Instant::now();
+        loop {
+            if hub_connections.read().await.is_empty() {
+                info!("All connections shut down gracefully.");
+                break;
+            }
+            if start.elapsed() > timeout {
+                let guard = hub_connections.read().await;
+                warn!(
+                    "Timeout waiting for connections to shut down. Remaining connections: {} (addrs: {:?})",
+                    guard.len(),
+                    guard.keys().collect::<Vec<_>>()
+                );
+                // Force close remaining connections upon timeout
+                for info in guard.values() {
+                    info.connection.close(0u32.into(), b"Shutdown Timeout");
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// A background task that periodically checks all active connections for data activity.
+    async fn monitor_activity(
+        hub_connections: Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
+        check_interval: Duration,
+        idle_threshold: Duration,
+    ) {
+        let mut interval = tokio::time::interval(check_interval);
+        info!(
+            "Starting connection activity monitor. Check interval: {:?}, Idle threshold: {:?}",
+            check_interval, idle_threshold
+        );
+
+        loop {
+            interval.tick().await;
+            // Use read lock instead of write lock to allow concurrent stream creation
+            let conns_guard = hub_connections.read().await;
+
+            for (addr, info) in conns_guard.iter() {
+                let current_stats = info.connection.stats();
+
+                // Lock only the specific connection's tracker
+                if let Ok(mut tracker) = info.activity_tracker.lock() {
+                    // Check if any data has been sent or received since the last check.
+                    if current_stats.udp_tx.bytes > tracker.last_stats.udp_tx.bytes
+                        || current_stats.udp_rx.bytes > tracker.last_stats.udp_rx.bytes
+                    {
+                        // Activity detected, update the timestamp and reset the warning flag.
+                        trace!("Activity detected on connection to {}", addr);
+                        tracker.last_activity_time = Instant::now();
+                        tracker.idle_warning_logged = false;
+                    } else {
+                        // No activity, check if the idle threshold has been exceeded.
+                        let idle_duration = tracker.last_activity_time.elapsed();
+                        if idle_duration > idle_threshold && !tracker.idle_warning_logged {
+                            warn!(
+                                "Connection to {} has been idle for approximately {:?}.",
+                                addr, idle_duration
+                            );
+                            tracker.idle_warning_logged = true; // Log only once per idle period.
+                        }
+                    }
+                    // Update the stats for the next comparison.
+                    tracker.last_stats = current_stats;
+                }
+            }
+        }
+    }
+
+    /// The central orchestrator for ensuring QUIC connections match DNS records.
+    ///
+    /// This function acts as a "reconciler". Its primary goal is to ensure that the
+    /// application's actual state (the set of active `manage_single_quic_connection` tasks)
+    /// matches the desired state (the set of IP addresses from the latest DNS query).
+    async fn reconcile_to_dns<S: StreamHandler>(
+        server_name: &str,
+        server_port: u16,
+        endpoint: &quinn::Endpoint,
+        stream_handler: S,
+        maintenance_task_handles: &mut HashMap<SocketAddr, tokio::task::JoinHandle<()>>,
+        hub_connections: &Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
+        endpoint_type: &'static str,
+    ) {
+        info!("Reconciling QUIC connections to DNS for '{}'", server_name);
+
+        // Step 1: Define the "Desired State" by resolving the DNS name.
+        let server_name_owned = server_name.to_string();
+        let latest_addrs = match tokio::task::spawn_blocking(move || {
+            (server_name_owned.as_str(), server_port).to_socket_addrs()
+        })
+        .await
+        {
+            Ok(Ok(addrs)) => addrs.collect::<HashSet<SocketAddr>>(),
+            Ok(Err(e)) => {
+                error!(
+                    "DNS resolution failed for '{}': {}. Keeping existing connections.",
+                    server_name, e
+                );
+                maintenance_task_handles.keys().cloned().collect()
+            }
+            Err(e) => {
+                error!(
+                    "DNS resolution task panicked: {}. Keeping existing connections.",
+                    e
+                );
+                maintenance_task_handles.keys().cloned().collect()
+            }
+        };
+        info!("Resolved '{}' to: {:?}", server_name, latest_addrs);
+
+        // If DNS resolution was successful but returned an empty list, and we have active connections,
+        // treat it as a temporary failure to prevent mass disconnection.
+        if latest_addrs.is_empty() && !maintenance_task_handles.is_empty() {
+            warn!(
+                "DNS resolution for '{}' returned an empty list, but active connections exist. Assuming temporary failure and keeping existing connections.",
+                server_name
+            );
+            return;
+        }
+
+        // 1. Identify IPs to be removed (no longer in DNS) and signal them to shut down.
+        let mut to_remove = Vec::new();
+        for addr in maintenance_task_handles.keys() {
+            if !latest_addrs.contains(addr) {
+                to_remove.push(*addr);
+            }
+        }
+
+        if !to_remove.is_empty() {
+            let conns_guard = hub_connections.read().await;
+            for addr in to_remove {
+                if let Some(info) = conns_guard.get(&addr) {
+                    // Only send shutdown if it's currently active. Avoids sending multiple signals.
+                    let prev_status = info.hub_status.swap(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
+                    if prev_status != HubStatus::ShuttingDown as u8 {
+                        info!("Address {} is no longer in DNS records, initiating graceful shutdown.", addr);
+                        info.shutdown_initiator.store(ShutdownInitiator::Endpoint as u8, Ordering::Relaxed);
+                        info.shutdown_signal.notify_one();
+                    }
+                }
+            }
+        }
+
+        // 2. Clean up any maintenance tasks that have fully completed (either by error or shutdown).
+        maintenance_task_handles.retain(|addr, handle| {
+            if handle.is_finished() {
+                info!("Connection task for {} has finished. It will be removed.", addr);
+                false
+            } else {
+                true
+            }
+        });
+
+        // 2.5. Check for tasks that are in DNS but are ShuttingDown.
+        // If found, remove them from maintenance_task_handles (detach them) so they are recreated in step 3.
+        let conns_guard = hub_connections.read().await;
+        let mut shutting_down_addrs = Vec::new();
+        for addr in maintenance_task_handles.keys() {
+            if latest_addrs.contains(addr) {
+                if let Some(info) = conns_guard.get(addr) {
+                    if info.hub_status.load(Ordering::Relaxed) == HubStatus::ShuttingDown as u8 {
+                        shutting_down_addrs.push(*addr);
+                    }
+                }
+            }
+        }
+        drop(conns_guard);
+
+        for addr in shutting_down_addrs {
+            info!("Connection to {} is shutting down but is in DNS. Detaching old task and starting a new one.", addr);
+            maintenance_task_handles.remove(&addr); // Detach. The task continues to run/drain until finished.
+        }
+
+        // 3. Start new tasks for IPs that are in DNS but have no running task.
+        let current_task_addrs: HashSet<_> = maintenance_task_handles.keys().cloned().collect();
+        for addr_to_add in latest_addrs.difference(&current_task_addrs) {
+            info!("New address {} found in DNS, starting a new connection manager task.", addr_to_add);
+            let endpoint_clone = endpoint.clone();
+            let server_name_clone = server_name.to_string();
+            let stream_handler_clone = stream_handler.clone();
+            let hub_connections_clone = hub_connections.clone();
+            let handle = tokio::spawn(HubConnection::run(
+                endpoint_clone,
+                *addr_to_add,
+                server_name_clone,
+                stream_handler_clone,
+                hub_connections_clone,
+                endpoint_type,
+            ));
+            maintenance_task_handles.insert(*addr_to_add, handle);
+        }
+
+        info!(
+            "Reconciliation complete. {} active QUIC connection tasks.",
+            maintenance_task_handles.len(),
+        );
+    }
+}
+
+impl HubConnection {
+    /// Helper to remove a connection from the map if the ID matches.
+    async fn remove_from_map(
+        hub_connections: &Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
+        addr: SocketAddr,
+        connection_id: usize,
+    ) -> Option<HubConnection> {
+        let mut guard = hub_connections.write().await;
+        if let std::collections::hash_map::Entry::Occupied(entry) = guard.entry(addr) {
+            if entry.get().connection.stable_id() == connection_id {
+                return Some(entry.remove());
+            }
+        }
+        None
+    }
+
+    /// Spawns a background task to handle incoming datagrams (control messages) for a connection.
+    fn spawn_control_datagram_handler(
+        connection: quinn::Connection,
+        hub_status: Arc<AtomicU8>,
+        shutdown_signal: Arc<Notify>,
+        shutdown_initiator: Arc<AtomicU8>,
+        addr: SocketAddr,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                match connection.read_datagram().await {
+                    Ok(bytes) => {
+                        let msg = bytes.as_ref();
+                        if msg == b"notify_shutdown" {
+                            info!(
+                                "Received notify_shutdown from Hub ({}). Marking connection as ShuttingDown.",
+                                addr
+                            );
+                            hub_status.store(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
+                            shutdown_initiator.store(ShutdownInitiator::Hub as u8, Ordering::Relaxed);
+                            // Trigger the main task's graceful shutdown logic via the shared channel.
+                            shutdown_signal.notify_one();
+                        } else if msg == b"notify_standby" {
+                            info!(
+                                "Received notify_standby from Hub ({}). Marking connection as StandBy.",
+                                addr
+                            );
+                            hub_status.store(HubStatus::StandBy as u8, Ordering::Relaxed);
+                        } else if msg == b"notify_active" {
+                            info!(
+                                "Received notify_active from Hub ({}). Marking connection as Active.",
+                                addr
+                            );
+                            hub_status.store(HubStatus::Active as u8, Ordering::Relaxed);
+                        }
+                    }
+                    Err(_) => {
+                        // Connection closed or error, stop the handler.
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Manages the entire lifecycle of a single QUIC connection in an autonomous task.
+    ///
+    /// This function is the "worker" spawned by the `reconcile_to_dns` "manager".
+    /// It embodies a "self-registration and self-cleanup" pattern, making it highly autonomous.
+    async fn run<S: StreamHandler>(
+        endpoint: quinn::Endpoint,
+        addr: SocketAddr,
+        server_name: String,
+        stream_handler: S,
+        hub_connections: Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
+        endpoint_type: &'static str,
+    ) {
+        let span = info_span!("HubConnection::run", remote_addr = %addr);
+        let start_time_utc = Utc::now();
+        async move {
+            // --- 1. Connect ---
+            info!("Attempting to establish QUIC connection...");
+            let connection = match endpoint.connect(addr, &server_name) {
+                Ok(connecting) => match connecting.await {
+                    Ok(conn) => {
+                        info!("Connection handshake successful.");
+                        conn
+                    }
+                    Err(e) => {
+                        // Log the specific connection error. The reconciler will eventually try again.
+                        error!("Connection failed during handshake: {}", e);
+                        return; // End of this task.
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to initiate connection: {}", e);
+                    return; // End of this task
+                }
+            };
+
+            // Extract certificate information for logging and ID compliance.
+            let (peer_cn, _) = common::check_and_get_info_connection(connection.clone()).await;
+
+            // --- 2. Register ---
+            // This task is now responsible for this connection, so add it to the shared map.
+            let stream_count = Arc::new(AtomicUsize::new(0));
+            let hub_status = Arc::new(AtomicU8::new(HubStatus::Active as u8));
+            let shutdown_signal = Arc::new(Notify::new());
+            let shutdown_initiator = Arc::new(AtomicU8::new(ShutdownInitiator::None as u8));
+            let connection_id = connection.stable_id();
+            let cleanup_done = Arc::new(AtomicBool::new(false));
+
+            // Start the datagram handler to listen for control messages (e.g., shutdown notifications).
+            // This handles shutdown requests *initiated by the Hub*.
+            let datagram_handler =
+                Self::spawn_control_datagram_handler(connection.clone(), hub_status.clone(), shutdown_signal.clone(), shutdown_initiator.clone(), addr);
+
+            let info = HubConnection {
+                connection: connection.clone(),
+                dest_addr: addr,
+                start_time: Instant::now(),
+                stream_count: stream_count.clone(),
+                activity_tracker: std::sync::Mutex::new(ActivityTracker {
+                    last_stats: connection.stats(),
+                    last_activity_time: Instant::now(),
+                    idle_warning_logged: false,
+                }),
+                endpoint_type,
+                provider_start_sent: AtomicBool::new(false),
+                hub_status: hub_status.clone(),
+                shutdown_signal: shutdown_signal.clone(),
+                shutdown_initiator: shutdown_initiator.clone(),
+                peer_cn: peer_cn.clone(),
+            };
+
+            hub_connections.write().await.insert(addr, info);
+            info!(
+                message = "QUIC connection started",
+                startAt = %start_time_utc.to_rfc3339(),
+                quic_connection_id = %connection_id,
+                spnEndPoint = ?peer_cn,
+                endpoint_type = endpoint_type,
+                server_ip = %addr,
+            );
+
+            // RAII Guard to ensure cleanup if the task is aborted (e.g. by DNS reconciliation).
+            struct HubConnectionCleanupGuard {
+                addr: SocketAddr,
+                connection_id: usize,
+                hub_connections: Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
+                start_time_utc: chrono::DateTime<Utc>,
+                datagram_handler: JoinHandle<()>,
+                cleanup_done: Arc<AtomicBool>,
+            }
+            impl Drop for HubConnectionCleanupGuard {
+                fn drop(&mut self) {
+                    self.datagram_handler.abort();
+                    if self.cleanup_done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let addr = self.addr;
+                    let connection_id = self.connection_id;
+                    let hub_connections = self.hub_connections.clone();
+                    let start_time_utc = self.start_time_utc;
+                    tokio::spawn(async move {
+                        // This runs only when the task is aborted (e.g. DNS change), ensuring cleanup.
+                        if let Some(removed_info) = HubConnection::remove_from_map(&hub_connections, addr, connection_id).await {
+                            info!(
+                                message = "QUIC connection task aborted",
+                                startAt = %start_time_utc.to_rfc3339(),
+                                    quic_connection_id = %removed_info.connection.stable_id(),
+                                    spnEndPoint = ?removed_info.peer_cn,
+                                    endpoint_type = removed_info.endpoint_type,
+                                    server_ip = %removed_info.dest_addr,
+                                    duration_secs = removed_info.start_time.elapsed().as_secs_f64(),
+                                    reason = "Task Aborted",
+                                    terminateReason = "shutdown",
+                                    total_quic_streams = removed_info.stream_count.load(Ordering::Relaxed),
+                            );
+                            // Ensure the connection is closed
+                            removed_info.connection.close(0u32.into(), b"Task Aborted");
+                        }
+                    });
+                }
+            }
+            let _guard = HubConnectionCleanupGuard {
+                addr,
+                connection_id,
+                hub_connections: hub_connections.clone(),
+                start_time_utc,
+                datagram_handler,
+                cleanup_done: cleanup_done.clone(),
+            };
+
+            // --- 3. Work (Accept Streams) & Monitor (Watch for Close) ---
+            let reason = tokio::select! {
+                // Branch A: Connection closes unexpectedly (by peer or network error).
+                reason = connection.closed() => {
+                    info!("Connection to {} closed by peer or due to error.", addr);
+                    reason
+                },
+
+                // Branch B: Graceful shutdown is requested by us (via DNS change or signal).
+                _ = shutdown_signal.notified() => {
+                    let initiator_val = shutdown_initiator.load(Ordering::Relaxed);
+                    let initiator_str = match initiator_val {
+                        1 => "Hub instruction",
+                        2 => "Endpoint termination",
+                        _ => "Unknown",
+                    };
+                    info!("Graceful shutdown triggered by {} for connection to {}. Draining...", initiator_str, addr);
+
+                    // The caller should have already set the status, but we ensure it.
+                    hub_status.store(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
+
+                    // Notify the peer hub to stop sending new streams.
+                    connection.set_max_concurrent_bi_streams(0u32.into());
+
+                    // Send notify_shutdown datagram
+                    if let Err(e) = connection.send_datagram(b"notify_shutdown".to_vec().into()) {
+                        warn!("Failed to send notify_shutdown datagram to {}: {}", addr, e);
+                    }
+
+                    // Wait for active streams to drain or for a timeout.
+                    let timeout = common::GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT;
+                    let start = Instant::now();
+                    let mut forced = false;
+                    loop {
+                        let count = stream_count.load(Ordering::Relaxed);
+                        if count == 0 {
+                            info!("Connection {} drained successfully.", addr);
+                            break;
+                        }
+                        if start.elapsed() > timeout {
+                            warn!("Connection {} drain timed out with {} active streams. Forcing close.", addr, count);
+                            forced = true;
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+
+                    // Close the connection from our side.
+                    let reason_bytes = if forced {
+                        b"Graceful Shutdown: Forced by Timeout".as_slice()
+                    } else {
+                        b"Graceful Shutdown: Completed".as_slice()
+                    };
+                    connection.close(0u32.into(), reason_bytes);
+
+                    // Wait for the connection to fully close and get the final reason.
+                    connection.closed().await
+                },
+
+
+                // Branch C: Normal work (accepting server-initiated streams).
+                _ = async {
+                    loop {
+                        match connection.accept_bi().await {
+                            Ok(streams) => {
+                                stream_count.fetch_add(1, Ordering::Relaxed);
+                            let guard = StreamGuard { count: stream_count.clone() };
+                                trace!("Accepted a new bidirectional stream. Active streams: {}", stream_count.load(Ordering::Relaxed));
+                            stream_handler.handle_stream(streams.0, streams.1, guard).await;
+                            }
+                            Err(e) => {
+                                // This error typically occurs when the connection is closing.
+                                trace!("Stream listener for {} is stopping: {}", addr, e);
+                                break;
+                            }
+                        }
+                    }
+                } => {
+                    // The stream acceptance loop broke. We assume the connection is closing and wait for the official reason.
+                    connection.closed().await
+                }
+            };
+
+            // --- 4. Cleanup ---
+            // The connection has closed. This task's final responsibility is to remove itself from the shared map.
+            let removed_info = HubConnection::remove_from_map(&hub_connections, addr, connection_id).await;
+            cleanup_done.store(true, Ordering::Relaxed);
+
+            if let Some(removed_info) = removed_info {
+                let terminate_reason = match &reason {
+                    quinn::ConnectionError::LocallyClosed => "shutdown",
+                    quinn::ConnectionError::ConnectionClosed(_)
+                    | quinn::ConnectionError::ApplicationClosed(_)
+                    | quinn::ConnectionError::Reset => "terminatedByPeer",
+                    quinn::ConnectionError::VersionMismatch
+                    | quinn::ConnectionError::TransportError(_)
+                    | quinn::ConnectionError::TimedOut
+                    | quinn::ConnectionError::CidsExhausted => "error",
+                };
+
+                info!(
+                    message = "QUIC connection ended",
+                    startAt = %start_time_utc.to_rfc3339(),
+                    quic_connection_id = %removed_info.connection.stable_id(),
+                    spnEndPoint = ?removed_info.peer_cn,
+                    endpoint_type = removed_info.endpoint_type,
+                    server_ip = %removed_info.dest_addr,
+                    duration_secs = removed_info.start_time.elapsed().as_secs_f64(),
+                    reason = %reason,
+                    terminateReason = terminate_reason,
+                    total_quic_streams = removed_info.stream_count.load(Ordering::Relaxed),
+                );
+            } else {
+                // This case is unlikely but possible if another part of the system (e.g., a forceful shutdown)
+                // clears the map.
+                warn!("Connection info for {} was already removed during cleanup.", addr);
+            }
+
+            // --- 5. Terminate ---
+            // The task's work is done.
+            info!("Task finished.");
+        }
+        .instrument(span)
+        .await
+    }
 }
 
 /// Defines the strategy for selecting a connection from the pool.
