@@ -103,7 +103,7 @@ use std::time::Instant;
 
 use chrono::Utc;
 use quinn::{ReadExactError, RecvStream, SendStream};
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -1111,7 +1111,7 @@ async fn open_stream_on_best_connection(
                 let values: Vec<_> = conns_guard.values()
                     .filter(|info| info.hub_status.load(Ordering::Relaxed) == HubStatus::Active as u8)
                     .collect();
-                values.choose(&mut rand::thread_rng()).copied()
+                values.choose(&mut rand::rng()).copied()
             }
             ConnectionSelectionStrategy::LeastStreams => conns_guard
                 .values()
