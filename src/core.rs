@@ -12,64 +12,49 @@
 //!
 //! To use this crate as a library, follow these steps:
 //!
-//! 1.  Call `create_spn_endpoint` with your configuration to initialize the provider.
+//! 1.  Call [`create_spn_consumer_endpoint`] or [`create_spn_provider_endpoint`] to initialize the endpoint.
 //!     This will start background tasks to manage QUIC connections.
-//! 2.  To **open** a client-initiated stream, call `SpnEndpoint::open_stream`.
-//! 3.  To **accept** a server-initiated stream, call `SpnEndpoint::accept_stream`.
-//! 4.  The `SpnEndpoint` handle manages the lifecycle. When it is dropped, all background
+//! 2.  **Consumer**: Call [`SpnConsumerEndpoint::open_stream`] to start a new stream.
+//! 3.  **Provider**: Call [`SpnProviderEndpoint::accept_stream`] to accept a stream initiated by the hub.
+//! 4.  The returned [`QuicBidiStream`] implements [`tokio::io::AsyncRead`] and [`tokio::io::AsyncWrite`].
+//! 5.  The endpoint handle manages the lifecycle. When it is dropped, all background
 //!     tasks are automatically shut down.
 //!
-//! ### Example
+//! ### Example (Provider)
 //!
-//! The following example demonstrates how to open a client-initiated stream and
-//! simultaneously listen for server-initiated streams in a separate task.
+//! The following example demonstrates how to accept server-initiated streams.
 //!
 //! ```no_run
-//! # use qtest5eventdclient_multi::client_core::create_spn_endpoint;
+//! # use ep_lib::core::create_spn_provider_endpoint;
 //! # use tokio::io::AsyncWriteExt;
-//! # use std::sync::Arc;
 //! # use tracing::info;
 //! #
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! // Wrap the provider in an Arc to share it between tasks.
-//! let provider = Arc::new(create_spn_endpoint(
-//!     "example.com",
-//!     4433,
+//! let provider = create_spn_provider_endpoint(
+//!     "https://example.com:4433",
 //!     "path/to/cert.pem",
 //!     "path/to/key.pem",
 //!     "path/to/ca.pem",
-//! ).await?);
+//! ).await?;
 //!
-//! // --- Accepting Server-Initiated Streams ---
-//! // Spawn a task to handle incoming streams from the server.
-//! let provider_clone = provider.clone();
-//! tokio::spawn(async move {
-//!     loop {
-//!         info!("Waiting to accept a server-initiated stream...");
-//!         match provider_clone.accept_stream().await {
-//!             Ok((_send, _recv, _guard)) => {
-//!                 info!("Accepted a server-initiated stream!");
-//!                 // Handle the stream...
-//!             }
-//!             Err(e) => {
-//!                 info!("Error accepting stream: {}. Listener task shutting down.", e);
-//!                 break;
-//!             }
+//! loop {
+//!     info!("Waiting to accept a server-initiated stream...");
+//!     match provider.accept_stream().await {
+//!         Ok(stream) => {
+//!             info!("Accepted a server-initiated stream!");
+//!             // Handle the stream (e.g. echo)
+//!             tokio::spawn(async move {
+//!                 let (mut reader, mut writer) = tokio::io::split(stream);
+//!                 let _ = tokio::io::copy(&mut reader, &mut writer).await;
+//!             });
+//!         }
+//!         Err(e) => {
+//!             info!("Error accepting stream: {}. Listener task shutting down.", e);
+//!             break;
 //!         }
 //!     }
-//! });
-//!
-//! // --- Opening Client-Initiated Streams ---
-//! // In the main task, open a client-initiated stream.
-//! info!("Opening a client-initiated stream...");
-//! let (mut send_stream, _recv_stream, _guard) = provider.open_stream().await?;
-//! send_stream.write_all(b"hello from client").await?;
-//! info!("Client-initiated stream opened and data sent.");
-//!
-//! // The provider will shut down automatically when the Arc's strong count
-//! // reaches zero (i.e., when both the main task and the listener task finish).
-//! # tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Give spawned task time to run
+//! }
 //! # Ok(())
 //! # }
 //! ```
@@ -104,7 +89,7 @@ use std::time::Instant;
 use chrono::Utc;
 use quinn::{ReadExactError, RecvStream, SendStream};
 use rand::seq::IndexedRandom;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
@@ -127,7 +112,7 @@ use crate::common::create_quic_client_endpoint;
 /// Dropping it early will decrement the active stream count, potentially causing
 /// the connection to be closed prematurely during a graceful shutdown.
 #[derive(Debug)]
-pub struct StreamGuard {
+pub(crate) struct StreamGuard {
     count: Arc<AtomicUsize>,
 }
 
@@ -148,7 +133,7 @@ impl Drop for StreamGuard {
 /// gracefully, ensuring a clean exit (RAII).
 
 #[derive(Debug)]
-pub struct SpnEndpoint {
+pub(crate) struct SpnEndpoint {
     /// The QUIC endpoint handle, retained to ensure proper closure on drop.
     endpoint: quinn::Endpoint,
     /// Shared dictionary of active QUIC connections.
@@ -194,11 +179,11 @@ impl SpnEndpoint {
     /// # Returns
     /// A `Result` containing a tuple of `(SendStream, RecvStream, StreamGuard)` on success.
     /// The `StreamGuard` must be kept alive as long as the stream is in use.
-    pub async fn accept_stream(&self) -> Result<(SendStream, RecvStream, StreamGuard), Box<dyn Error>> {
+    pub async fn accept_stream(&self) -> Result<QuicBidiStream, Box<dyn Error>> {
         loop {
             let mut q = self.accepted_stream_queue.lock().await;
-            if let Some(stream) = q.pop_front() {
-                return Ok(stream);
+            if let Some((send, recv, guard)) = q.pop_front() {
+                return Ok(QuicBidiStream::new(send, recv, guard));
             }
             drop(q);
             self.accepted_stream_notify.notified().await;
@@ -222,15 +207,109 @@ impl SpnEndpoint {
     /// The `StreamGuard` must be kept alive as long as the stream is in use.
     pub async fn open_stream(
         &self,
-    ) -> Result<(SendStream, RecvStream, StreamGuard), Box<dyn Error + Send + Sync>> {
+    ) -> Result<QuicBidiStream, Box<dyn Error + Send + Sync>> {
         info!("Requesting a new QUIC stream from the provider.");
-        let stream = open_stream_on_best_connection(
+        let (send, recv, guard) = open_stream_on_best_connection(
             self.hub_connections.clone(),
             ConnectionSelectionStrategy::Random,
         )
         .await?;
-        Ok(stream)
+        Ok(QuicBidiStream::new(send, recv, guard))
     }
+}
+
+/// A specialized endpoint for Consumer applications.
+///
+/// This struct wraps [`SpnEndpoint`] and exposes only the functionality relevant
+/// to a consumer: opening streams to the provider.
+#[derive(Debug)]
+pub struct SpnConsumerEndpoint {
+    inner: SpnEndpoint,
+}
+
+impl SpnConsumerEndpoint {
+    /// Opens a new QUIC stream on the best available connection.
+    ///
+    /// See [`SpnEndpoint::open_stream`] for details.
+    pub async fn open_stream(
+        &self,
+    ) -> Result<QuicBidiStream, Box<dyn Error + Send + Sync>> {
+        self.inner.open_stream().await
+    }
+}
+
+/// Creates and initializes an [`SpnConsumerEndpoint`].
+///
+/// This is a convenience wrapper around [`create_spn_endpoint`] that configures
+/// the endpoint for consumer usage (e.g., setting the endpoint type to "consumer").
+///
+/// # Arguments
+/// * `spn_hub_url`: The URL of the SPN Hub.
+/// * `cert_path`: Path to the client certificate.
+/// * `key_path`: Path to the client private key.
+/// * `trust_store_path`: Path to the CA trust store.
+pub async fn create_spn_consumer_endpoint(
+    spn_hub_url: &str,
+    cert_path: &str,
+    key_path: &str,
+    trust_store_path: &str,
+) -> Result<SpnConsumerEndpoint, Box<dyn Error>> {
+    let inner = create_spn_endpoint(
+        spn_hub_url,
+        cert_path,
+        key_path,
+        trust_store_path,
+        &[b"sc01-consumer"],
+        "consumer",
+    ).await?;
+    Ok(SpnConsumerEndpoint { inner })
+}
+
+/// A specialized endpoint for Provider applications.
+///
+/// This struct wraps [`SpnEndpoint`] and exposes only the functionality relevant
+/// to a provider: accepting streams from the hub.
+#[derive(Debug)]
+pub struct SpnProviderEndpoint {
+    inner: SpnEndpoint,
+}
+
+impl SpnProviderEndpoint {
+    /// Waits for and accepts a new server-initiated bidirectional stream.
+    ///
+    /// See [`SpnEndpoint::accept_stream`] for details.
+    pub async fn accept_stream(
+        &self,
+    ) -> Result<QuicBidiStream, Box<dyn Error>> {
+        self.inner.accept_stream().await
+    }
+}
+
+/// Creates and initializes an [`SpnProviderEndpoint`].
+///
+/// This is a convenience wrapper around [`create_spn_endpoint`] that configures
+/// the endpoint for provider usage (e.g., setting the endpoint type to "provider").
+///
+/// # Arguments
+/// * `spn_hub_url`: The URL of the SPN Hub.
+/// * `cert_path`: Path to the client certificate.
+/// * `key_path`: Path to the client private key.
+/// * `trust_store_path`: Path to the CA trust store.
+pub async fn create_spn_provider_endpoint(
+    spn_hub_url: &str,
+    cert_path: &str,
+    key_path: &str,
+    trust_store_path: &str,
+) -> Result<SpnProviderEndpoint, Box<dyn Error>> {
+    let inner = create_spn_endpoint(
+        spn_hub_url,
+        cert_path,
+        key_path,
+        trust_store_path,
+        &[b"sc01-provider"],
+        "provider",
+    ).await?;
+    Ok(SpnProviderEndpoint { inner })
 }
 
 /// Creates and initializes an `SpnEndpoint`, launching the background tasks
@@ -251,19 +330,19 @@ impl SpnEndpoint {
 /// # Returns
 /// A `Result` containing an `SpnEndpoint` instance on success, or an error if
 /// initialization fails (e.g., due to invalid certificate paths).
-pub async fn create_spn_endpoint(
-    spn_hub_url: &'static str,
-    cert_path: &'static str,
-    key_path: &'static str,
-    trust_store_path: &'static str,
-    alpn: &'static [&'static [u8]],
+pub(crate) async fn create_spn_endpoint(
+    spn_hub_url: &str,
+    cert_path: &str,
+    key_path: &str,
+    trust_store_path: &str,
+    alpn: &[&[u8]],
     endpoint_type: &'static str,
 ) -> Result<SpnEndpoint, Box<dyn Error>> {
     let parsed_url = url::Url::parse(spn_hub_url).expect("Failed to parse URL");
     let host_slice = parsed_url
         .host_str()
         .expect("Could not find a server name (host) in the URL.");
-    let server_name: &'static str = Box::leak(host_slice.to_string().into_boxed_str());
+    let server_name = host_slice.to_string();
     let server_port: u16 = parsed_url
         .port_or_known_default()
         .expect("Could not determine the port number.");
@@ -296,7 +375,7 @@ pub async fn create_spn_endpoint(
     };
 
     let hub_connections_maintenance_task = spawn_connection_maintenance_task(
-        server_name.to_string(),
+        server_name,
         server_port,
         endpoint.clone(),
         stream_handler,
@@ -314,6 +393,77 @@ pub async fn create_spn_endpoint(
     })
 }
 
+/// A wrapper that combines a QUIC `SendStream` and `RecvStream` into a single
+/// stream that implements `tokio::io::AsyncRead` and `tokio::io::AsyncWrite`.
+///
+/// This is useful for integrating with libraries like `hyper` or `tokio-postgres`
+/// that expect a single bidirectional I/O object.
+///
+/// # Example
+/// ```no_run
+/// # use ep_lib::core::{SpnEndpoint, QuicBidiStream};
+/// # use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// # async fn example(provider: SpnEndpoint) -> Result<(), Box<dyn std::error::Error>> {
+/// let mut stream = provider.open_stream().await?;
+///
+/// stream.write_all(b"hello").await?;
+/// let mut response = String::new();
+/// stream.read_to_string(&mut response).await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct QuicBidiStream {
+    send: BufWriter<SendStream>,
+    recv: BufReader<RecvStream>,
+    _guard: StreamGuard,
+}
+
+impl QuicBidiStream {
+    /// Creates a new `QuicBidiStream` from a `SendStream`, `RecvStream` and `StreamGuard`.
+    pub(crate) fn new(send: SendStream, recv: RecvStream, guard: StreamGuard) -> Self {
+        Self {
+            send: BufWriter::new(send),
+            recv: BufReader::new(recv),
+            _guard: guard,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for QuicBidiStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.recv).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for QuicBidiStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.send).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.send).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.send).poll_shutdown(cx)
+    }
+}
+
 //======================================================================
 //== Endpoint Agent Binary API
 //======================================================================
@@ -324,8 +474,6 @@ pub async fn create_spn_endpoint(
 /// the main event loop (DNS checks, TCP listening, signal handling), and graceful shutdown.
 /// It is primarily intended for simple, standalone binaries like `client01` and `client02`.
 ///
-/// # Arguments
-/// * `config`: An `AppConfig` struct containing all necessary configuration for this client instance.
 #[doc(hidden)]
 pub async fn run_client_consumer(
     server_name: &str,
@@ -1171,27 +1319,6 @@ async fn open_stream_on_best_connection(
     }
 }
 
-/// Configuration for a client application instance.
-/// This struct encapsulates all the parameters that differ between client binaries.
-#[derive(Debug)]
-pub struct AppConfig {
-    /// Path to the client's certificate PEM file.
-    pub cert_path: &'static str,
-    /// Path to the client's private key PEM file.
-    pub key_path: &'static str,
-    /// Path to the trusted CA certificate(s) PEM file for server verification.
-    pub trust_store_path: &'static str,
-    /// A slice of supported ALPN protocols to advertise to the server.
-    pub alpn: &'static [&'static [u8]],
-    /// The local TCP address to listen on for control connections.
-    /// **Note:** This is primarily used by the legacy `run_client` function.
-    pub tcp_bind_address: &'static str,
-    /// The DNS name of the server to connect to.
-    pub server_name: &'static str,
-    /// The port number of the server to connect to.
-    pub server_port: u16,
-}
-
 /// Holds the state of a single QUIC connection to a Hub.
 #[derive(Debug)]
 struct HubConnection {
@@ -1805,7 +1932,7 @@ enum ConnectionSelectionStrategy {
 
 /// Configuration for the TCP-to-QUIC proxy retry mechanism.
 #[derive(Debug, Clone, Copy)]
-pub struct ProxyRetryConfig {
+struct ProxyRetryConfig {
     /// Maximum number of times to retry opening a QUIC stream after a disconnection.
     pub max_retries: u32,
     /// The delay to wait before attempting a retry.
