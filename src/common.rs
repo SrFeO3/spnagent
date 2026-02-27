@@ -4,7 +4,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::error::Error;
 use std::sync::Arc;
 use tokio::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use x509_parser::oid_registry::OID_X509_COMMON_NAME;
 use x509_parser::parse_x509_certificate;
@@ -104,7 +104,14 @@ pub fn create_quic_client_endpoint(
         .max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into()?));
     quic_client_config.transport_config(Arc::new(transport_config));
 
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
+    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap()).or_else(|e| {
+        warn!(
+            "Failed to bind to IPv6 socket '[::]:0': {}. Falling back to IPv4 '0.0.0.0:0'.",
+            e
+        );
+        quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+    })?;
+
     endpoint.set_default_client_config(quic_client_config);
     Ok(endpoint)
 }
