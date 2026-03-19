@@ -1116,7 +1116,9 @@ fn spawn_connection_maintenance_task<S: StreamHandler>(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
-        let mut maintenance_task_handles = HashMap::new();
+        let mut maintenance_task_handles =
+            HashMap::<SocketAddr, (JoinHandle<()>, Arc<AtomicBool>)>::new();
+
 
         loop {
             interval.tick().await;
@@ -1406,7 +1408,7 @@ impl HubConnectionManager {
         server_port: u16,
         endpoint: &quinn::Endpoint,
         stream_handler: S,
-        maintenance_task_handles: &mut HashMap<SocketAddr, tokio::task::JoinHandle<()>>,
+        maintenance_task_handles: &mut HashMap<SocketAddr, (tokio::task::JoinHandle<()>, Arc<AtomicBool>)>,
         hub_connections: &Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
         endpoint_type: &'static str,
     ) {
@@ -1455,6 +1457,13 @@ impl HubConnectionManager {
             }
         }
 
+        // 1.5. Deactivate tasks for IPs that are no longer in DNS.
+        for addr in &to_remove {
+            if let Some((_, active_flag)) = maintenance_task_handles.get(addr) {
+                active_flag.store(false, Ordering::Relaxed);
+            }
+        }
+
         if !to_remove.is_empty() {
             let conns_guard = hub_connections.read().await;
             for addr in to_remove {
@@ -1471,7 +1480,7 @@ impl HubConnectionManager {
         }
 
         // 2. Clean up any maintenance tasks that have fully completed (either by error or shutdown).
-        maintenance_task_handles.retain(|addr, handle| {
+        maintenance_task_handles.retain(|addr, (handle, _)| {
             if handle.is_finished() {
                 info!("Connection task for {} has finished. It will be removed.", addr);
                 false
@@ -1508,6 +1517,7 @@ impl HubConnectionManager {
             let server_name_clone = server_name.to_string();
             let stream_handler_clone = stream_handler.clone();
             let hub_connections_clone = hub_connections.clone();
+            let task_active = Arc::new(AtomicBool::new(true));
             let handle = tokio::spawn(HubConnection::run(
                 endpoint_clone,
                 *addr_to_add,
@@ -1515,8 +1525,9 @@ impl HubConnectionManager {
                 stream_handler_clone,
                 hub_connections_clone,
                 endpoint_type,
+                task_active.clone(),
             ));
-            maintenance_task_handles.insert(*addr_to_add, handle);
+            maintenance_task_handles.insert(*addr_to_add, (handle, task_active));
         }
 
         info!(
@@ -1598,100 +1609,118 @@ impl HubConnection {
         stream_handler: S,
         hub_connections: Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
         endpoint_type: &'static str,
+        task_active: Arc<AtomicBool>,
     ) {
         let span = info_span!("HubConnection::run", remote_addr = %addr);
-        let start_time_utc = Utc::now();
         async move {
-            // --- 1. Connect ---
-            info!("Attempting to establish QUIC connection...");
-            let connection = match endpoint.connect(addr, &server_name) {
-                Ok(connecting) => match connecting.await {
-                    Ok(conn) => {
-                        info!("Connection handshake successful.");
-                        conn
-                    }
-                    Err(e) => {
-                        // Log the specific connection error. The reconciler will eventually try again.
-                        error!("Connection failed during handshake: {}", e);
-                        return; // End of this task.
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to initiate connection: {}", e);
-                    return; // End of this task
+            info!("Starting persistent connection task.");
+            loop {
+                // Check if this task is still valid (according to DNS reconciliation)
+                if !task_active.load(Ordering::Relaxed) {
+                    info!("Connection task marked as inactive. Exiting loop.");
+                    break;
                 }
-            };
 
-            // Extract certificate information for logging and ID compliance.
-            let (peer_cn, _) = common::check_and_get_info_connection(connection.clone()).await;
+                let start_time_utc = Utc::now();
 
-            // --- 2. Register ---
-            // This task is now responsible for this connection, so add it to the shared map.
-            let stream_count = Arc::new(AtomicUsize::new(0));
-            let hub_status = Arc::new(AtomicU8::new(HubStatus::Active as u8));
-            let shutdown_signal = Arc::new(Notify::new());
-            let shutdown_initiator = Arc::new(AtomicU8::new(ShutdownInitiator::None as u8));
-            let connection_id = connection.stable_id();
-            let cleanup_done = Arc::new(AtomicBool::new(false));
-
-            // Start the datagram handler to listen for control messages (e.g., shutdown notifications).
-            // This handles shutdown requests *initiated by the Hub*.
-            let datagram_handler =
-                Self::spawn_control_datagram_handler(connection.clone(), hub_status.clone(), shutdown_signal.clone(), shutdown_initiator.clone(), addr);
-
-            let info = HubConnection {
-                connection: connection.clone(),
-                dest_addr: addr,
-                start_time: Instant::now(),
-                stream_count: stream_count.clone(),
-                activity_tracker: std::sync::Mutex::new(ActivityTracker {
-                    last_stats: connection.stats(),
-                    last_activity_time: Instant::now(),
-                    idle_warning_logged: false,
-                }),
-                endpoint_type,
-                provider_start_sent: AtomicBool::new(false),
-                hub_status: hub_status.clone(),
-                shutdown_signal: shutdown_signal.clone(),
-                shutdown_initiator: shutdown_initiator.clone(),
-                peer_cn: peer_cn.clone(),
-            };
-
-            hub_connections.write().await.insert(addr, info);
-            info!(
-                message = "QUIC connection started",
-                startAt = %start_time_utc.to_rfc3339(),
-                quic_connection_id = %connection_id,
-                spnEndPoint = ?peer_cn,
-                endpoint_type = endpoint_type,
-                server_ip = %addr,
-            );
-
-            // RAII Guard to ensure cleanup if the task is aborted (e.g. by DNS reconciliation).
-            struct HubConnectionCleanupGuard {
-                addr: SocketAddr,
-                connection_id: usize,
-                hub_connections: Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
-                start_time_utc: chrono::DateTime<Utc>,
-                datagram_handler: JoinHandle<()>,
-                cleanup_done: Arc<AtomicBool>,
-            }
-            impl Drop for HubConnectionCleanupGuard {
-                fn drop(&mut self) {
-                    self.datagram_handler.abort();
-                    if self.cleanup_done.load(Ordering::Relaxed) {
-                        return;
+                // --- 1. Connect ---
+                info!("Attempting to establish QUIC connection...");
+                let connection = match endpoint.connect(addr, &server_name) {
+                    Ok(connecting) => match connecting.await {
+                        Ok(conn) => {
+                            info!("Connection handshake successful.");
+                            conn
+                        }
+                        Err(e) => {
+                            error!("Connection handshake failed: {}. Retrying in {:?}...", e, common::HUB_CONNECTION_RETRY_INTERVAL);
+                            tokio::time::sleep(common::HUB_CONNECTION_RETRY_INTERVAL).await;
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to initiate connection: {}. Retrying in {:?}...", e, common::HUB_CONNECTION_RETRY_INTERVAL);
+                        tokio::time::sleep(common::HUB_CONNECTION_RETRY_INTERVAL).await;
+                        continue;
                     }
-                    let addr = self.addr;
-                    let connection_id = self.connection_id;
-                    let hub_connections = self.hub_connections.clone();
-                    let start_time_utc = self.start_time_utc;
-                    tokio::spawn(async move {
-                        // This runs only when the task is aborted (e.g. DNS change), ensuring cleanup.
-                        if let Some(removed_info) = HubConnection::remove_from_map(&hub_connections, addr, connection_id).await {
-                            info!(
-                                message = "QUIC connection task aborted",
-                                startAt = %start_time_utc.to_rfc3339(),
+                };
+
+                // Extract certificate information for logging and ID compliance.
+                let (peer_cn, _) = common::check_and_get_info_connection(connection.clone()).await;
+
+                // --- 2. Register ---
+                // Note: A minor race condition exists if the task is deactivated while connecting.
+                // The connection will be cleaned up by the next DNS reconciliation.
+
+                let stream_count = Arc::new(AtomicUsize::new(0));
+                let hub_status = Arc::new(AtomicU8::new(HubStatus::Active as u8));
+                let shutdown_signal = Arc::new(Notify::new());
+                let shutdown_initiator = Arc::new(AtomicU8::new(ShutdownInitiator::None as u8));
+                let connection_id = connection.stable_id();
+                let cleanup_done = Arc::new(AtomicBool::new(false));
+
+                // Start the datagram handler
+                let datagram_handler = Self::spawn_control_datagram_handler(
+                    connection.clone(),
+                    hub_status.clone(),
+                    shutdown_signal.clone(),
+                    shutdown_initiator.clone(),
+                    addr,
+                );
+
+                let info = HubConnection {
+                    connection: connection.clone(),
+                    dest_addr: addr,
+                    start_time: Instant::now(),
+                    stream_count: stream_count.clone(),
+                    activity_tracker: std::sync::Mutex::new(ActivityTracker {
+                        last_stats: connection.stats(),
+                        last_activity_time: Instant::now(),
+                        idle_warning_logged: false,
+                    }),
+                    endpoint_type,
+                    provider_start_sent: AtomicBool::new(false),
+                    hub_status: hub_status.clone(),
+                    shutdown_signal: shutdown_signal.clone(),
+                    shutdown_initiator: shutdown_initiator.clone(),
+                    peer_cn: peer_cn.clone(),
+                };
+
+                hub_connections.write().await.insert(addr, info);
+                info!(
+                    message = "QUIC connection started",
+                    startAt = %start_time_utc.to_rfc3339(),
+                    quic_connection_id = %connection_id,
+                    spnEndPoint = ?peer_cn,
+                    endpoint_type = endpoint_type,
+                    server_ip = %addr,
+                );
+
+                // RAII Guard definition...
+                struct HubConnectionCleanupGuard {
+                    addr: SocketAddr,
+                    connection_id: usize,
+                    hub_connections: Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
+                    start_time_utc: chrono::DateTime<Utc>,
+                    datagram_handler: JoinHandle<()>,
+                    cleanup_done: Arc<AtomicBool>,
+                }
+                impl Drop for HubConnectionCleanupGuard {
+                    fn drop(&mut self) {
+                        self.datagram_handler.abort();
+                        if self.cleanup_done.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let addr = self.addr;
+                        let connection_id = self.connection_id;
+                        let hub_connections = self.hub_connections.clone();
+                        let start_time_utc = self.start_time_utc;
+                        tokio::spawn(async move {
+                            if let Some(removed_info) =
+                                HubConnection::remove_from_map(&hub_connections, addr, connection_id).await
+                            {
+                                info!(
+                                    message = "QUIC connection task aborted",
+                                    startAt = %start_time_utc.to_rfc3339(),
                                     quic_connection_id = %removed_info.connection.stable_id(),
                                     spnEndPoint = ?removed_info.peer_cn,
                                     endpoint_type = removed_info.endpoint_type,
@@ -1700,143 +1729,145 @@ impl HubConnection {
                                     reason = "Task Aborted",
                                     terminateReason = "shutdown",
                                     total_quic_streams = removed_info.stream_count.load(Ordering::Relaxed),
-                            );
-                            // Ensure the connection is closed
-                            removed_info.connection.close(0u32.into(), b"Task Aborted");
-                        }
-                    });
-                }
-            }
-            let _guard = HubConnectionCleanupGuard {
-                addr,
-                connection_id,
-                hub_connections: hub_connections.clone(),
-                start_time_utc,
-                datagram_handler,
-                cleanup_done: cleanup_done.clone(),
-            };
-
-            // --- 3. Work (Accept Streams) & Monitor (Watch for Close) ---
-            let reason = tokio::select! {
-                // Branch A: Connection closes unexpectedly (by peer or network error).
-                reason = connection.closed() => {
-                    info!("Connection to {} closed by peer or due to error.", addr);
-                    reason
-                },
-
-                // Branch B: Graceful shutdown is requested by us (via DNS change or signal).
-                _ = shutdown_signal.notified() => {
-                    let initiator_val = shutdown_initiator.load(Ordering::Relaxed);
-                    let initiator_str = match initiator_val {
-                        1 => "Hub instruction",
-                        2 => "Endpoint termination",
-                        _ => "Unknown",
-                    };
-                    info!("Graceful shutdown triggered by {} for connection to {}. Draining...", initiator_str, addr);
-
-                    // The caller should have already set the status, but we ensure it.
-                    hub_status.store(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
-
-                    // Notify the peer hub to stop sending new streams.
-                    connection.set_max_concurrent_bi_streams(0u32.into());
-
-                    // Send notify_shutdown datagram
-                    if let Err(e) = connection.send_datagram(b"notify_shutdown".to_vec().into()) {
-                        warn!("Failed to send notify_shutdown datagram to {}: {}", addr, e);
-                    }
-
-                    // Wait for active streams to drain or for a timeout.
-                    let timeout = common::GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT;
-                    let start = Instant::now();
-                    let mut forced = false;
-                    loop {
-                        let count = stream_count.load(Ordering::Relaxed);
-                        if count == 0 {
-                            info!("Connection {} drained successfully.", addr);
-                            break;
-                        }
-                        if start.elapsed() > timeout {
-                            warn!("Connection {} drain timed out with {} active streams. Forcing close.", addr, count);
-                            forced = true;
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-
-                    // Close the connection from our side.
-                    let reason_bytes = if forced {
-                        b"Graceful Shutdown: Forced by Timeout".as_slice()
-                    } else {
-                        b"Graceful Shutdown: Completed".as_slice()
-                    };
-                    connection.close(0u32.into(), reason_bytes);
-
-                    // Wait for the connection to fully close and get the final reason.
-                    connection.closed().await
-                },
-
-
-                // Branch C: Normal work (accepting server-initiated streams).
-                _ = async {
-                    loop {
-                        match connection.accept_bi().await {
-                            Ok(streams) => {
-                                stream_count.fetch_add(1, Ordering::Relaxed);
-                            let guard = StreamGuard { count: stream_count.clone() };
-                                trace!("Accepted a new bidirectional stream. Active streams: {}", stream_count.load(Ordering::Relaxed));
-                            stream_handler.handle_stream(streams.0, streams.1, guard).await;
+                                );
+                                removed_info.connection.close(0u32.into(), b"Task Aborted");
                             }
-                            Err(e) => {
-                                // This error typically occurs when the connection is closing.
-                                trace!("Stream listener for {} is stopping: {}", addr, e);
-                                break;
-                            }
-                        }
+                        });
                     }
-                } => {
-                    // The stream acceptance loop broke. We assume the connection is closing and wait for the official reason.
-                    connection.closed().await
                 }
-            };
-
-            // --- 4. Cleanup ---
-            // The connection has closed. This task's final responsibility is to remove itself from the shared map.
-            let removed_info = HubConnection::remove_from_map(&hub_connections, addr, connection_id).await;
-            cleanup_done.store(true, Ordering::Relaxed);
-
-            if let Some(removed_info) = removed_info {
-                let terminate_reason = match &reason {
-                    quinn::ConnectionError::LocallyClosed => "shutdown",
-                    quinn::ConnectionError::ConnectionClosed(_)
-                    | quinn::ConnectionError::ApplicationClosed(_)
-                    | quinn::ConnectionError::Reset => "terminatedByPeer",
-                    quinn::ConnectionError::VersionMismatch
-                    | quinn::ConnectionError::TransportError(_)
-                    | quinn::ConnectionError::TimedOut
-                    | quinn::ConnectionError::CidsExhausted => "error",
+                let _guard = HubConnectionCleanupGuard {
+                    addr,
+                    connection_id,
+                    hub_connections: hub_connections.clone(),
+                    start_time_utc,
+                    datagram_handler,
+                    cleanup_done: cleanup_done.clone(),
                 };
 
-                info!(
-                    message = "QUIC connection ended",
-                    startAt = %start_time_utc.to_rfc3339(),
-                    quic_connection_id = %removed_info.connection.stable_id(),
-                    spnEndPoint = ?removed_info.peer_cn,
-                    endpoint_type = removed_info.endpoint_type,
-                    server_ip = %removed_info.dest_addr,
-                    duration_secs = removed_info.start_time.elapsed().as_secs_f64(),
-                    reason = %reason,
-                    terminateReason = terminate_reason,
-                    total_quic_streams = removed_info.stream_count.load(Ordering::Relaxed),
-                );
-            } else {
-                // This case is unlikely but possible if another part of the system (e.g., a forceful shutdown)
-                // clears the map.
-                warn!("Connection info for {} was already removed during cleanup.", addr);
-            }
+                // --- 3. Work (Accept Streams) & Monitor (Watch for Close) ---
+                let reason = tokio::select! {
+                    // Branch A: Connection closes unexpectedly (by peer or network error).
+                    reason = connection.closed() => {
+                        info!("Connection to {} closed by peer or due to error.", addr);
+                        reason
+                    },
 
-            // --- 5. Terminate ---
-            // The task's work is done.
-            info!("Task finished.");
+                    // Branch B: Graceful shutdown is requested by us (via DNS change or signal).
+                    _ = shutdown_signal.notified() => {
+                        let initiator_val = shutdown_initiator.load(Ordering::Relaxed);
+                        let initiator_str = match initiator_val {
+                            1 => "Hub instruction",
+                            2 => "Endpoint termination",
+                            _ => "Unknown",
+                        };
+                        info!("Graceful shutdown triggered by {} for connection to {}. Draining...", initiator_str, addr);
+
+                        // The caller should have already set the status, but we ensure it.
+                        hub_status.store(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
+
+                        // Notify the peer hub to stop sending new streams.
+                        connection.set_max_concurrent_bi_streams(0u32.into());
+
+                        // Send notify_shutdown datagram
+                        if let Err(e) = connection.send_datagram(b"notify_shutdown".to_vec().into()) {
+                            warn!("Failed to send notify_shutdown datagram to {}: {}", addr, e);
+                        }
+
+                        // Wait for active streams to drain or for a timeout.
+                        let timeout = common::GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT;
+                        let start = Instant::now();
+                        let mut forced = false;
+                        loop {
+                            let count = stream_count.load(Ordering::Relaxed);
+                            if count == 0 {
+                                info!("Connection {} drained successfully.", addr);
+                                break;
+                            }
+                            if start.elapsed() > timeout {
+                                warn!("Connection {} drain timed out with {} active streams. Forcing close.", addr, count);
+                                forced = true;
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+
+                        // Close the connection from our side.
+                        let reason_bytes = if forced {
+                            b"Graceful Shutdown: Forced by Timeout".as_slice()
+                        } else {
+                            b"Graceful Shutdown: Completed".as_slice()
+                        };
+                        connection.close(0u32.into(), reason_bytes);
+
+                        // Wait for the connection to fully close and get the final reason.
+                        connection.closed().await
+                    },
+
+                    // Branch C: Normal work (accepting server-initiated streams).
+                    _ = async {
+                        loop {
+                            match connection.accept_bi().await {
+                                Ok(streams) => {
+                                    stream_count.fetch_add(1, Ordering::Relaxed);
+                                    let guard = StreamGuard { count: stream_count.clone() };
+                                    trace!("Accepted a new bidirectional stream. Active streams: {}", stream_count.load(Ordering::Relaxed));
+                                    stream_handler.handle_stream(streams.0, streams.1, guard).await;
+                                }
+                                Err(e) => {
+                                    trace!("Stream listener for {} is stopping: {}", addr, e);
+                                    break;
+                                }
+                            }
+                        }
+                    } => {
+                        connection.closed().await
+                    }
+                };
+
+                // --- 4. Cleanup ---
+                let removed_info =
+                    HubConnection::remove_from_map(&hub_connections, addr, connection_id).await;
+                cleanup_done.store(true, Ordering::Relaxed);
+
+                if let Some(removed_info) = removed_info {
+                    let terminate_reason = match &reason {
+                        quinn::ConnectionError::LocallyClosed => "shutdown",
+                        quinn::ConnectionError::ConnectionClosed(_)
+                        | quinn::ConnectionError::ApplicationClosed(_)
+                        | quinn::ConnectionError::Reset => "terminatedByPeer",
+                        quinn::ConnectionError::VersionMismatch
+                        | quinn::ConnectionError::TransportError(_)
+                        | quinn::ConnectionError::TimedOut
+                        | quinn::ConnectionError::CidsExhausted => "error",
+                    };
+
+                    info!(
+                        message = "QUIC connection ended",
+                        startAt = %start_time_utc.to_rfc3339(),
+                        quic_connection_id = %removed_info.connection.stable_id(),
+                        spnEndPoint = ?removed_info.peer_cn,
+                        endpoint_type = removed_info.endpoint_type,
+                        server_ip = %removed_info.dest_addr,
+                        duration_secs = removed_info.start_time.elapsed().as_secs_f64(),
+                        reason = %reason,
+                        terminateReason = terminate_reason,
+                        total_quic_streams = removed_info.stream_count.load(Ordering::Relaxed),
+                    );
+
+                    if terminate_reason == "shutdown" {
+                        info!("Connection task for {} finished gracefully. Exiting task.", addr);
+                        break; // Exit the loop on graceful shutdown
+                    }
+                } else {
+                    warn!("Connection info for {} was already removed during cleanup.", addr);
+                }
+
+                info!(
+                    "Connection to {} lost. Attempting to reconnect in {:?}...",
+                    addr, common::HUB_CONNECTION_RETRY_INTERVAL
+                );
+                tokio::time::sleep(common::HUB_CONNECTION_RETRY_INTERVAL).await;
+            }
         }
         .instrument(span)
         .await

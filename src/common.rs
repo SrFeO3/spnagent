@@ -23,6 +23,7 @@ const IDLE_TIMEOUT_SECS: u64 = 20;
 
 pub const GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const PROXY_BUFFER_SIZE: usize = 16 * 1024;
+pub const HUB_CONNECTION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Initializes the tracing subscriber for logging.
 pub fn setup_tracing() {
