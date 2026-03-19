@@ -1,13 +1,19 @@
-// spn is an infrastructure system for building and managing distributed component applications,
-// particularly those that are containerized. The spn system consists of two main parts that
-// work in tandem: spn_hub and spn_agent. This is the source code for spnagent/provider.
-//
-// USAGE:
-//   To run the consumer with info-level logging:
-//   RUST_LOG=info cargo run --bin provider
-//
-// TODO:
-//   - Refactor the names of the environment variables used for startup configuration.
+//! # SPN Provider Agent
+//!
+//! `spn` is an infrastructure system for building and managing distributed component applications,
+//! particularly those that are containerized. The `spn` system consists of two main parts that
+//! work in tandem: `spn_hub` and `spn_agent`.
+//!
+//! This binary implements the **Provider** agent. It connects to the SPN Hub and waits for
+//! incoming streams. When a stream is accepted, it connects to a local service (the "Forward Address")
+//! and proxies traffic between the Hub and the local service.
+//!
+//! ## Usage
+//! To run the provider with info-level logging:
+//! ```sh
+//! RUST_LOG=info cargo run --bin provider
+//! ```
+
 use clap::Parser;
 
 use ep_lib::core;

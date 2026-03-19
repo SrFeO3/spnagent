@@ -1,6 +1,6 @@
 [package]
 name = "spnagent"
-version = "0.96.3"
+version = "0.96.4"
 edition = "2024"
 
 [lib]
@@ -17,12 +17,12 @@ path = "src/bin/consumer.rs"
 
 [dependencies]
 chrono = "0.4"
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 quinn = "0.11"
 rand = "0.10"
 rustls = { version = "0.23", features = ["ring"] }
-tokio = { version = "1.49", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5"

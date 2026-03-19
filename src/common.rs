@@ -1,3 +1,9 @@
+//! # Common Utilities
+//!
+//! This module provides shared utility functions and configurations used by both
+//! the Consumer and Provider endpoints. It handles certificate loading,
+//! crypto provider initialization, QUIC endpoint creation, and connection inspection.
+
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -38,8 +44,8 @@ pub fn initialize_crypto_provider() {
 ///
 /// # Arguments
 ///
-/// * `my_cert_path`: Path to the my certificate PEM file.
-/// * `my_key_path`: Path to the my private key PEM file.
+/// * `my_cert_path`: Path to the client's certificate PEM file.
+/// * `my_key_path`: Path to the client's private key PEM file.
 /// * `trust_ca_cert_path`: Path to the trusted CA certificate(s) PEM file.
 pub fn load_certs_and_key(
     my_cert_path: &str,
@@ -116,6 +122,18 @@ pub fn create_quic_client_endpoint(
     Ok(endpoint)
 }
 
+/// Inspects a connected QUIC connection to extract and log peer identity information.
+///
+/// This function retrieves the peer's certificate chain (if present) to log the Subject, Issuer,
+/// Serial, and Common Name (CN). It also logs the negotiated ALPN protocol.
+///
+/// # Arguments
+/// * `connection`: The active QUIC connection to inspect.
+///
+/// # Returns
+/// A tuple containing:
+/// * `Option<String>`: The Common Name (CN) from the peer's certificate, if found.
+/// * `Option<String>`: The negotiated ALPN protocol, if any.
 pub async fn check_and_get_info_connection(
     connection: quinn::Connection,
 ) -> (Option<String>, Option<String>) {

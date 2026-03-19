@@ -1,13 +1,19 @@
-// spn is an infrastructure system for building and managing distributed component applications,
-// particularly those that are containerized. The spn system consists of two main parts that
-// work in tandem: spn_hub and spn_agent. This is the source code for spnagent/consumer.
-//
-// USAGE:
-//   To run the consumer with info-level logging:
-//   RUST_LOG=info cargo run --bin consumer
-//
-// TODO:
-//   - Refactor the names of the environment variables used for startup configuration.
+//! # SPN Consumer Agent
+//!
+//! `spn` is an infrastructure system for building and managing distributed component applications,
+//! particularly those that are containerized. The `spn` system consists of two main parts that
+//! work in tandem: `spn_hub` and `spn_agent`.
+//!
+//! This binary implements the **Consumer** agent. It connects to the SPN Hub and exposes a local
+//! TCP listener. Traffic received on this local listener is forwarded via QUIC streams through
+//! the Hub to a target Provider.
+//!
+//! ## Usage
+//! To run the consumer with info-level logging:
+//! ```sh
+//! RUST_LOG=info cargo run --bin consumer
+//! ```
+
 use clap::Parser;
 
 use ep_lib::core;

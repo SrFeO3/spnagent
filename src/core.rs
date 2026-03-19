@@ -1,79 +1,12 @@
 //! # Endpoint Core Logic & Library API
 //!
-//! This module implements the primary logic for the client application. It serves two purposes:
+//! This module implements the primary logic for the SPN Endpoint. It serves two purposes:
 //!
 //! 1.  **Standalone Client Core**: The `run_client` function provides an all-in-one, self-contained
-//!     client application logic, suitable for simple binaries like `client01` and `client02`.
+//!     endpoint logic, suitable for binaries like `provider` and `consumer`.
 //!
 //! 2.  **Reusable Library API**: For more flexible integration into other applications, this module
 //!     exposes a library-style API centered around the `SpnEndpoint`.
-//!
-//! ## Library Usage
-//!
-//! To use this crate as a library, follow these steps:
-//!
-//! 1.  Call [`create_spn_consumer_endpoint`] or [`create_spn_provider_endpoint`] to initialize the endpoint.
-//!     This will start background tasks to manage QUIC connections.
-//! 2.  **Consumer**: Call [`SpnConsumerEndpoint::open_stream`] to start a new stream.
-//! 3.  **Provider**: Call [`SpnProviderEndpoint::accept_stream`] to accept a stream initiated by the hub.
-//! 4.  The returned [`QuicBidiStream`] implements [`tokio::io::AsyncRead`] and [`tokio::io::AsyncWrite`].
-//! 5.  The endpoint handle manages the lifecycle. When it is dropped, all background
-//!     tasks are automatically shut down.
-//!
-//! ### Example (Provider)
-//!
-//! The following example demonstrates how to accept server-initiated streams.
-//!
-//! ```no_run
-//! # use ep_lib::core::create_spn_provider_endpoint;
-//! # use tokio::io::AsyncWriteExt;
-//! # use tracing::info;
-//! #
-//! # #[tokio::main]
-//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let provider = create_spn_provider_endpoint(
-//!     "https://example.com:4433",
-//!     "path/to/cert.pem",
-//!     "path/to/key.pem",
-//!     "path/to/ca.pem",
-//! ).await?;
-//!
-//! loop {
-//!     info!("Waiting to accept a server-initiated stream...");
-//!     match provider.accept_stream().await {
-//!         Ok(stream) => {
-//!             info!("Accepted a server-initiated stream!");
-//!             // Handle the stream (e.g. echo)
-//!             tokio::spawn(async move {
-//!                 let (mut reader, mut writer) = tokio::io::split(stream);
-//!                 let _ = tokio::io::copy(&mut reader, &mut writer).await;
-//!             });
-//!         }
-//!         Err(e) => {
-//!             info!("Error accepting stream: {}. Listener task shutting down.", e);
-//!             break;
-//!         }
-//!     }
-//! }
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # history
-//! - multiple hub support
-//! - multiple provider support, provider select
-//! - quic stream re-connect support
-//! - graceful down
-//!
-//! # To Do
-//! - Investigate using DashMap for the connection pool.
-//! - Check if the number of Tokio tasks in the consumer crate is decreasing too slowly.
-//!
-//! # Considerations
-//! For copying data between two streams, we evaluated `tokio::io::copy_bidirectional` against
-//! a custom implementation using `tokio::select!`, `join!`, or `try_join!`. The decision
-//! is based on a trade-off between robustness, counter accuracy, error detail, performance,
-//! and code simplicity.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -136,7 +69,7 @@ impl Drop for StreamGuard {
 pub(crate) struct SpnEndpoint {
     /// The QUIC endpoint handle, retained to ensure proper closure on drop.
     endpoint: quinn::Endpoint,
-    /// Shared dictionary of active QUIC connections.
+    /// Shared map of active QUIC connections.
     hub_connections: Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
     /// Handle to the main background maintenance task.
     hub_connections_maintenance_task: JoinHandle<()>,
@@ -320,7 +253,7 @@ pub async fn create_spn_provider_endpoint(
 /// configuration, before spawning the connection maintenance loop in the background.
 ///
 /// # Arguments
-/// * `spn_hub_url`: The URL name of the spn server to connect to.
+/// * `spn_hub_url`: The URL of the SPN Hub to connect to.
 /// * `cert_path`: Path to the client's certificate PEM file.
 /// * `key_path`: Path to the client's private key PEM file.
 /// * `trust_store_path`: Path to the trusted CA certificate(s) PEM file for server verification.
@@ -355,7 +288,7 @@ pub(crate) async fn create_spn_endpoint(
 
     let endpoint = create_quic_client_endpoint(certs, key, truststore, alpn)?;
 
-    // Shared state for the provider and its background tasks.
+    // Shared state for the endpoint and its background tasks.
     let hub_connections = Arc::new(RwLock::new(HashMap::<SocketAddr, HubConnection>::new()));
     // Channel for streams accepted from the server, to be passed to the library user.
     let accepted_stream_queue = Arc::new(Mutex::new(VecDeque::new()));
@@ -364,8 +297,8 @@ pub(crate) async fn create_spn_endpoint(
     // Start the activity monitor task. This task will run in the background.
     let activity_monitor_task = tokio::spawn(HubConnectionManager::monitor_activity(
         hub_connections.clone(),
-        Duration::from_secs(10),// Check for activity every 10 seconds.
-        Duration::from_secs(30),// Log a warning if a connection is idle for more than 30 seconds.
+        Duration::from_secs(10), // Check for activity every 10 seconds.
+        Duration::from_secs(30), // Log a warning if a connection is idle for more than 30 seconds.
     ));
 
     let stream_handler = LibraryStreamHandler {
@@ -468,11 +401,11 @@ impl tokio::io::AsyncWrite for QuicBidiStream {
 //== Endpoint Agent Binary API
 //======================================================================
 
-/// The all-in-one entry point for running a provider application.
+/// The all-in-one entry point for running a consumer application.
 ///
 /// This function encapsulates the entire client lifecycle, including setup,
 /// the main event loop (DNS checks, TCP listening, signal handling), and graceful shutdown.
-/// It is primarily intended for simple, standalone binaries like `client01` and `client02`.
+/// It is primarily intended for simple, standalone binaries.
 ///
 #[doc(hidden)]
 pub async fn run_client_consumer(
@@ -505,7 +438,7 @@ pub async fn run_client_consumer(
     let endpoint =
         create_quic_client_endpoint(cert_path, key_path, trust_store_path, &[b"sc01-consumer"])?;
 
-    // Dictionary to store active quic connections and their info, accessible from multiple tasks.
+    // Shared map to store active QUIC connections and their info, accessible from multiple tasks.
     let hub_connections = Arc::new(RwLock::new(HashMap::<SocketAddr, HubConnection>::new()));
 
     // Start the activity monitor task. This task will run in the background.
@@ -603,7 +536,12 @@ pub async fn run_client_consumer(
     Ok(())
 }
 
-// consumer
+/// The all-in-one entry point for running a provider application.
+///
+/// This function encapsulates the entire client lifecycle, including setup,
+/// the main event loop (DNS checks, signal handling), and graceful shutdown.
+/// It is primarily intended for simple, standalone binaries.
+///
 #[doc(hidden)]
 pub async fn run_client_provider(
     server_name: &str,
@@ -635,7 +573,7 @@ pub async fn run_client_provider(
     let endpoint =
         create_quic_client_endpoint(cert_path, key_path, trust_store_path, &[b"sc01-provider"])?;
 
-    // Dictionary to store active quic connections and their info, accessible from multiple tasks.
+    // Shared map to store active QUIC connections and their info, accessible from multiple tasks.
     let hub_connections = Arc::new(RwLock::new(HashMap::<SocketAddr, HubConnection>::new()));
 
     // Start the activity monitor task. This task will run in the background.
@@ -981,32 +919,18 @@ async fn copy_bidirectional_with_status(
     }
 }
 
-/// Handles a single incoming QUIC stream by echoing back all received data.
+/// Handles a single incoming QUIC stream for a Provider by proxying it to a local TCP service.
 ///
-/// This function is designed to be a generic stream handler that can be spawned as a new task
-/// for each accepted stream. It also manages an atomic counter to track the number of
-/// active streams for a given connection.
+/// This function is spawned as a new task for each stream accepted from the Hub.
+/// It waits for a signal byte, connects to the configured local TCP service, and then
+/// proxies data bidirectionally between the QUIC stream and the TCP stream.
 ///
 /// ### Responsibilities
-/// 1.  **Stream Counting**: It uses a RAII guard (`StreamCounterGuard`) to decrement a shared
-///     `stream_count` when the function scope is exited, ensuring the count is always accurate
-///     even if the stream processing fails.
-/// 2.  **Echo Logic**: It reads all data from the `recv_stream`, logs the total amount, and
-///     writes the exact same data back to the `send_stream`.
-/// 3.  **Graceful Shutdown**: It properly closes the sending side of the stream (`send_stream.finish()`)
-///     after echoing the data.
-///
-/// # Arguments
-/// * `send_stream`: The stream for sending data back to the peer.
-/// * `recv_stream`: The stream for receiving data from the peer.
-/// * `stream_count`: An atomic counter shared by all streams of a single parent connection.
-///
-/// For provider
-/// 1.  accept quic bi stream from server (and consumer behind the server)
-/// 2.  wait 1 byte from quic stream
-/// 3.  connect local TCP stream
-/// 4.  copy local TCP stream and quic stream
-///     no special treatment (if TCP stream down then drop QUIC stream, if QUIC stream down then drop TCP stream)
+/// 1.  **Protocol Handshake**: Waits for a signal byte from the Consumer before connecting to TCP.
+/// 2.  **TCP Connection**: Establishes a connection to the local service defined by `tcp_bind_address`.
+/// 3.  **Proxying**: Uses `copy_bidirectional_with_status` to transfer data.
+/// 4.  **Resource Management**: The `StreamGuard` (passed as `_guard`) ensures the active stream count
+///     is decremented when this task finishes.
 async fn handle_new_quic_stream_for_provider(
     mut send_stream: SendStream,
     mut recv_stream: RecvStream,
