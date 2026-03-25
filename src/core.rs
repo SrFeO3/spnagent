@@ -427,7 +427,8 @@ pub async fn run_client_consumer(
     let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())
         .expect("Failed to install SIGQUIT handler");
     info!(
-        "Consumer Client started (PID: {}) with config for: {}, {}, {}, {}, {}, {}",
+        "Consumer Client started (Version: {}, PID: {}) with config for: {}, {}, {}, {}, {}, {}",
+        env!("CARGO_PKG_VERSION"),
         std::process::id(),
         server_name, server_port, trust_store_path, cert_path, key_path, tcp_bind_address
     );
@@ -562,7 +563,8 @@ pub async fn run_client_provider(
     let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())
         .expect("Failed to install SIGQUIT handler");
     info!(
-        "Provider Client started (PID: {}) with config for: {}, {}, {}, {}, {}, {}",
+        "Provider Client started (Version: {}, PID: {}) with config for: {}, {}, {}, {}, {}, {}",
+        env!("CARGO_PKG_VERSION"),
         std::process::id(),
         server_name, server_port, trust_store_path, cert_path, key_path, tcp_bind_address
     );

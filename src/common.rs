@@ -60,15 +60,19 @@ pub fn load_certs_and_key(
     ),
     Box<dyn Error>,
 > {
-    let certs = CertificateDer::pem_file_iter(my_cert_path)?
-        .map(|cert_result| cert_result.map_err(|e| e.into()))
+    let certs = CertificateDer::pem_file_iter(my_cert_path)
+        .map_err(|e| format!("Failed to read certificate file at '{}': {}", my_cert_path, e))?
+        .map(|cert_result| cert_result.map_err(|e| format!("Failed to parse certificate in '{}': {}", my_cert_path, e).into()))
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
 
-    let key = PrivateKeyDer::from_pem_file(my_key_path)?;
+    let key = PrivateKeyDer::from_pem_file(my_key_path)
+        .map_err(|e| format!("Failed to load private key from '{}': {}", my_key_path, e))?;
 
     let mut truststore = quinn::rustls::RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter(trust_ca_cert_path)? {
-        truststore.add(cert?)?;
+    for cert in CertificateDer::pem_file_iter(trust_ca_cert_path)
+        .map_err(|e| format!("Failed to read trust store file at '{}': {}", trust_ca_cert_path, e))?
+    {
+        truststore.add(cert.map_err(|e| format!("Failed to parse CA certificate in '{}': {}", trust_ca_cert_path, e))?)?;
     }
 
     Ok((certs, key, truststore))
