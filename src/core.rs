@@ -1263,7 +1263,7 @@ struct HubConnection {
     /// The type of endpoint this connection belongs to (e.g., "provider", "consumer").
     pub endpoint_type: &'static str,
     /// Tracks if the provider start control message has been sent for this connection.
-    pub provider_start_sent: AtomicBool,
+    pub provider_start_sent: Arc<AtomicBool>,
     /// Tracks the perceived operational status of a peer Hub.
     pub hub_status: Arc<AtomicU8>,
     /// A signal to send a shutdown command to this connection's management task.
@@ -1562,6 +1562,7 @@ impl HubConnection {
         shutdown_signal: Arc<Notify>,
         shutdown_initiator: Arc<AtomicU8>,
         addr: SocketAddr,
+        provider_start_sent: Arc<AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -1589,6 +1590,12 @@ impl HubConnection {
                                 addr
                             );
                             hub_status.store(HubStatus::Active as u8, Ordering::Relaxed);
+                    } else if msg == b"notify_provider_stopped" {
+                        info!(
+                            "Received notify_provider_stopped from Hub ({}). Clearing provider_start_sent flag.",
+                            addr
+                        );
+                        provider_start_sent.store(false, Ordering::Relaxed);
                         }
                     }
                     Err(_) => {
@@ -1657,6 +1664,7 @@ impl HubConnection {
                 let hub_status = Arc::new(AtomicU8::new(HubStatus::Active as u8));
                 let shutdown_signal = Arc::new(Notify::new());
                 let shutdown_initiator = Arc::new(AtomicU8::new(ShutdownInitiator::None as u8));
+                let provider_start_sent = Arc::new(AtomicBool::new(false));
                 let connection_id = connection.stable_id();
                 let cleanup_done = Arc::new(AtomicBool::new(false));
 
@@ -1667,6 +1675,7 @@ impl HubConnection {
                     shutdown_signal.clone(),
                     shutdown_initiator.clone(),
                     addr,
+                    provider_start_sent.clone(),
                 );
 
                 let info = HubConnection {
@@ -1680,7 +1689,7 @@ impl HubConnection {
                         idle_warning_logged: false,
                     }),
                     endpoint_type,
-                    provider_start_sent: AtomicBool::new(false),
+                    provider_start_sent,
                     hub_status: hub_status.clone(),
                     shutdown_signal: shutdown_signal.clone(),
                     shutdown_initiator: shutdown_initiator.clone(),
