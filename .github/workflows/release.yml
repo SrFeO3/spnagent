@@ -28,6 +28,10 @@ jobs:
       - name: Build binaries
         run: cargo build --target x86_64-unknown-linux-musl --release
 
+      - name: Strip binary
+        run: strip target/x86_64-unknown-linux-musl/release/consumer
+        run: strip target/x86_64-unknown-linux-musl/release/provider
+
       - name: Prepare assets
         run: |
           mkdir -p release-assets
