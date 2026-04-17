@@ -29,8 +29,9 @@ jobs:
         run: cargo build --target x86_64-unknown-linux-musl --release
 
       - name: Strip binary
-        run: strip target/x86_64-unknown-linux-musl/release/consumer
-        run: strip target/x86_64-unknown-linux-musl/release/provider
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/consumer
+          strip target/x86_64-unknown-linux-musl/release/provider
 
       - name: Prepare assets
         run: |
