@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write
 
     steps:
       - name: Checkout code
@@ -38,6 +39,16 @@ jobs:
           mkdir -p release-assets
           cp target/x86_64-unknown-linux-musl/release/consumer release-assets/consumer
           cp target/x86_64-unknown-linux-musl/release/provider release-assets/provider
+          cat <<EOF > release-assets/Dockerfile.consumer
+          FROM scratch
+          COPY consumer /consumer
+          ENTRYPOINT ["/consumer"]
+          EOF
+          cat <<EOF > release-assets/Dockerfile.provider
+          FROM scratch
+          COPY provider /provider
+          ENTRYPOINT ["/provider"]
+          EOF
 
       - name: Create or Update Release
         uses: softprops/action-gh-release@v2
@@ -50,3 +61,42 @@ jobs:
             release-assets/provider
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (consumer)
+        id: meta-consumer
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/consumer
+          tags: |
+            type=raw,value=latest
+
+      - name: Build and push Docker image (consumer)
+        uses: docker/build-push-action@v5
+        with:
+          context: release-assets
+          file: release-assets/Dockerfile.consumer
+          push: true
+          tags: ${{ steps.meta-consumer.outputs.tags }}
+
+      - name: Extract Docker metadata (provider)
+        id: meta-provider
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/provider
+          tags: |
+            type=raw,value=latest
+
+      - name: Build and push Docker image (provider)
+        uses: docker/build-push-action@v5
+        with:
+          context: release-assets
+          file: release-assets/Dockerfile.provider
+          push: true
+          tags: ${{ steps.meta-provider.outputs.tags }}
