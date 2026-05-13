@@ -10,12 +10,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
-use std::future::Future;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 use std::time::Instant;
 
@@ -52,7 +52,10 @@ pub(crate) struct StreamGuard {
 impl Drop for StreamGuard {
     fn drop(&mut self) {
         let prev = self.count.fetch_sub(1, Ordering::Relaxed);
-        trace!("Stream guard dropped. Active streams: {}", prev.saturating_sub(1));
+        trace!(
+            "Stream guard dropped. Active streams: {}",
+            prev.saturating_sub(1)
+        );
     }
 }
 
@@ -138,9 +141,7 @@ impl SpnEndpoint {
     /// # Returns
     /// A `Result` containing a tuple of `(SendStream, RecvStream, StreamGuard)` on success.
     /// The `StreamGuard` must be kept alive as long as the stream is in use.
-    pub async fn open_stream(
-        &self,
-    ) -> Result<QuicBidiStream, Box<dyn Error + Send + Sync>> {
+    pub async fn open_stream(&self) -> Result<QuicBidiStream, Box<dyn Error + Send + Sync>> {
         info!("Requesting a new QUIC stream from the provider.");
         let (send, recv, guard) = open_stream_on_best_connection(
             self.hub_connections.clone(),
@@ -164,9 +165,7 @@ impl SpnConsumerEndpoint {
     /// Opens a new QUIC stream on the best available connection.
     ///
     /// See [`SpnEndpoint::open_stream`] for details.
-    pub async fn open_stream(
-        &self,
-    ) -> Result<QuicBidiStream, Box<dyn Error + Send + Sync>> {
+    pub async fn open_stream(&self) -> Result<QuicBidiStream, Box<dyn Error + Send + Sync>> {
         self.inner.open_stream().await
     }
 }
@@ -194,7 +193,8 @@ pub async fn create_spn_consumer_endpoint(
         trust_store_path,
         &[b"sc01-consumer"],
         "consumer",
-    ).await?;
+    )
+    .await?;
     Ok(SpnConsumerEndpoint { inner })
 }
 
@@ -211,9 +211,7 @@ impl SpnProviderEndpoint {
     /// Waits for and accepts a new server-initiated bidirectional stream.
     ///
     /// See [`SpnEndpoint::accept_stream`] for details.
-    pub async fn accept_stream(
-        &self,
-    ) -> Result<QuicBidiStream, Box<dyn Error>> {
+    pub async fn accept_stream(&self) -> Result<QuicBidiStream, Box<dyn Error>> {
         self.inner.accept_stream().await
     }
 }
@@ -241,7 +239,8 @@ pub async fn create_spn_provider_endpoint(
         trust_store_path,
         &[b"sc01-provider"],
         "provider",
-    ).await?;
+    )
+    .await?;
     Ok(SpnProviderEndpoint { inner })
 }
 
@@ -430,7 +429,12 @@ pub async fn run_client_consumer(
         "Consumer Client started (Version: {}, PID: {}) with config for: {}, {}, {}, {}, {}, {}",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
-        server_name, server_port, trust_store_path, cert_path, key_path, tcp_bind_address
+        server_name,
+        server_port,
+        trust_store_path,
+        cert_path,
+        key_path,
+        tcp_bind_address
     );
 
     let (cert_path, key_path, trust_store_path) =
@@ -445,8 +449,8 @@ pub async fn run_client_consumer(
     // Start the activity monitor task. This task will run in the background.
     let activity_monitor_task = tokio::spawn(HubConnectionManager::monitor_activity(
         hub_connections.clone(),
-        Duration::from_secs(10),    // Check for activity every 10 seconds.
-        Duration::from_secs(30),    // Log a warning if a connection is idle for more than 30 seconds.
+        Duration::from_secs(10), // Check for activity every 10 seconds.
+        Duration::from_secs(30), // Log a warning if a connection is idle for more than 30 seconds.
     ));
 
     // Bind a TCP listener for local control.
@@ -486,7 +490,9 @@ pub async fn run_client_consumer(
                                 strategy,
                                 retry_config,
                             )
-                            .instrument(info_span!("quic/tcp proxy session", client_addr = %remote_addr)),
+                            .instrument(
+                                info_span!("quic/tcp proxy session", client_addr = %remote_addr),
+                            ),
                         );
                     }
                     Err(e) => {
@@ -566,7 +572,12 @@ pub async fn run_client_provider(
         "Provider Client started (Version: {}, PID: {}) with config for: {}, {}, {}, {}, {}, {}",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
-        server_name, server_port, trust_store_path, cert_path, key_path, tcp_bind_address
+        server_name,
+        server_port,
+        trust_store_path,
+        cert_path,
+        key_path,
+        tcp_bind_address
     );
 
     let (cert_path, key_path, trust_store_path) =
@@ -580,8 +591,8 @@ pub async fn run_client_provider(
 
     // Start the activity monitor task. This task will run in the background.
     let activity_monitor_task = tokio::spawn(HubConnectionManager::monitor_activity(
-        hub_connections.clone(),    // Check for activity every 10 seconds.
-        Duration::from_secs(10),    // Log a warning if a connection is idle for more than 30 seconds.
+        hub_connections.clone(), // Check for activity every 10 seconds.
+        Duration::from_secs(10), // Log a warning if a connection is idle for more than 30 seconds.
         Duration::from_secs(30),
     ));
 
@@ -679,7 +690,8 @@ async fn handle_new_tcp_connection(
             remote_addr
         );
 
-        let quic_streams = match open_stream_on_best_connection(hub_connections.clone(), strategy).await
+        let quic_streams = match open_stream_on_best_connection(hub_connections.clone(), strategy)
+            .await
         {
             Ok(streams) => {
                 info!(
@@ -729,7 +741,7 @@ async fn handle_new_tcp_connection(
             }
             Err(proxy_error) => {
                 match proxy_error {
-                    ProxyError::TcpStreamError { error, bytes } => {
+                    ProxyError::TcpStream { error, bytes } => {
                         let (
                             tcp_read_bytes,
                             tcp_written_bytes,
@@ -747,7 +759,7 @@ async fn handle_new_tcp_connection(
                         );
                         return; // Non-recoverable TCP error, session is over.
                     }
-                    ProxyError::QuicStreamReadError { error, bytes } => {
+                    ProxyError::QuicStreamRead { error, bytes } => {
                         let (
                             tcp_read_bytes,
                             tcp_written_bytes,
@@ -764,7 +776,7 @@ async fn handle_new_tcp_connection(
                             tcp_written_bytes
                         );
                     }
-                    ProxyError::QuicStreamWriteError { error, bytes } => {
+                    ProxyError::QuicStreamWrite { error, bytes } => {
                         let (
                             tcp_read_bytes,
                             tcp_written_bytes,
@@ -912,9 +924,9 @@ async fn copy_bidirectional_with_status(
             );
             let bytes = (0, 0, 0, 0);
             let proxy_error = match e {
-                CopyError::Tcp(error) => ProxyError::TcpStreamError { error, bytes },
-                CopyError::QuicRead(error) => ProxyError::QuicStreamReadError { error, bytes },
-                CopyError::QuicWrite(error) => ProxyError::QuicStreamWriteError { error, bytes },
+                CopyError::Tcp(error) => ProxyError::TcpStream { error, bytes },
+                CopyError::QuicRead(error) => ProxyError::QuicStreamRead { error, bytes },
+                CopyError::QuicWrite(error) => ProxyError::QuicStreamWrite { error, bytes },
             };
             Err(proxy_error)
         }
@@ -1045,16 +1057,14 @@ trait StreamHandler: Send + Sync + Clone + 'static {
 #[derive(Clone)]
 struct ConsumerStreamHandler;
 impl StreamHandler for ConsumerStreamHandler {
-    fn handle_stream(
+    async fn handle_stream(
         &self,
         _send: quinn::SendStream,
         _recv: quinn::RecvStream,
         _guard: StreamGuard,
-    ) -> impl Future<Output = ()> + Send {
-        async move {
-            warn!("Consumer received an unexpected server-initiated stream. Dropping it.");
-            // guard is dropped here, decrementing count.
-        }
+    ) {
+        warn!("Consumer received an unexpected server-initiated stream. Dropping it.");
+        // guard is dropped here, decrementing count.
     }
 }
 
@@ -1100,7 +1110,9 @@ impl StreamHandler for LibraryStreamHandler {
                 q.push_back((send, recv, guard));
                 notify.notify_one();
             } else {
-                info!("Could not forward stream to application: queue is full. Stream will be dropped.");
+                info!(
+                    "Could not forward stream to application: queue is full. Stream will be dropped."
+                );
                 // guard is dropped here, decrementing count.
             }
         }
@@ -1120,7 +1132,6 @@ fn spawn_connection_maintenance_task<S: StreamHandler>(
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         let mut maintenance_task_handles =
             HashMap::<SocketAddr, (JoinHandle<()>, Arc<AtomicBool>)>::new();
-
 
         loop {
             interval.tick().await;
@@ -1173,19 +1184,20 @@ async fn open_stream_on_best_connection(
         }
 
         let selected_info = match strategy {
-            ConnectionSelectionStrategy::Oldest => {
-                conns_guard.values()
-                    .filter(|info| info.hub_status.load(Ordering::Relaxed) == HubStatus::Active as u8)
-                    .min_by_key(|info| info.start_time)
-            }
-            ConnectionSelectionStrategy::Newest => {
-                conns_guard.values()
-                    .filter(|info| info.hub_status.load(Ordering::Relaxed) == HubStatus::Active as u8)
-                    .max_by_key(|info| info.start_time)
-            }
+            ConnectionSelectionStrategy::Oldest => conns_guard
+                .values()
+                .filter(|info| info.hub_status.load(Ordering::Relaxed) == HubStatus::Active as u8)
+                .min_by_key(|info| info.start_time),
+            ConnectionSelectionStrategy::Newest => conns_guard
+                .values()
+                .filter(|info| info.hub_status.load(Ordering::Relaxed) == HubStatus::Active as u8)
+                .max_by_key(|info| info.start_time),
             ConnectionSelectionStrategy::Random => {
-                let values: Vec<_> = conns_guard.values()
-                    .filter(|info| info.hub_status.load(Ordering::Relaxed) == HubStatus::Active as u8)
+                let values: Vec<_> = conns_guard
+                    .values()
+                    .filter(|info| {
+                        info.hub_status.load(Ordering::Relaxed) == HubStatus::Active as u8
+                    })
                     .collect();
                 values.choose(&mut rand::rng()).copied()
             }
@@ -1209,7 +1221,10 @@ async fn open_stream_on_best_connection(
                 info.connection.rtt()
             );
             if !info.provider_start_sent.load(Ordering::Relaxed) {
-                if let Err(e) = info.connection.send_datagram(b"request_provider_start".to_vec().into()) {
+                if let Err(e) = info
+                    .connection
+                    .send_datagram(b"request_provider_start".to_vec().into())
+                {
                     warn!("Failed to send start_provider datagram: {}", e);
                 }
                 info.provider_start_sent.store(true, Ordering::Relaxed);
@@ -1230,7 +1245,9 @@ async fn open_stream_on_best_connection(
         match connection.open_bi().await {
             Ok((send, recv)) => {
                 stream_count.fetch_add(1, Ordering::Relaxed);
-                let guard = StreamGuard { count: stream_count };
+                let guard = StreamGuard {
+                    count: stream_count,
+                };
                 info!("Successfully opened a bidirectional stream.");
                 Ok((send, recv, guard))
             }
@@ -1320,9 +1337,12 @@ impl HubConnectionManager {
         info!("Initiating graceful shutdown for all active connections...");
         let conns_guard = hub_connections.read().await;
         for info in conns_guard.values() {
-            let prev_status = info.hub_status.swap(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
+            let prev_status = info
+                .hub_status
+                .swap(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
             if prev_status != HubStatus::ShuttingDown as u8 {
-                info.shutdown_initiator.store(ShutdownInitiator::Endpoint as u8, Ordering::Relaxed);
+                info.shutdown_initiator
+                    .store(ShutdownInitiator::Endpoint as u8, Ordering::Relaxed);
                 info.shutdown_signal.notify_one();
             }
         }
@@ -1410,7 +1430,10 @@ impl HubConnectionManager {
         server_port: u16,
         endpoint: &quinn::Endpoint,
         stream_handler: S,
-        maintenance_task_handles: &mut HashMap<SocketAddr, (tokio::task::JoinHandle<()>, Arc<AtomicBool>)>,
+        maintenance_task_handles: &mut HashMap<
+            SocketAddr,
+            (tokio::task::JoinHandle<()>, Arc<AtomicBool>),
+        >,
         hub_connections: &Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
         endpoint_type: &'static str,
     ) {
@@ -1471,10 +1494,16 @@ impl HubConnectionManager {
             for addr in to_remove {
                 if let Some(info) = conns_guard.get(&addr) {
                     // Only send shutdown if it's currently active. Avoids sending multiple signals.
-                    let prev_status = info.hub_status.swap(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
+                    let prev_status = info
+                        .hub_status
+                        .swap(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
                     if prev_status != HubStatus::ShuttingDown as u8 {
-                        info!("Address {} is no longer in DNS records, initiating graceful shutdown.", addr);
-                        info.shutdown_initiator.store(ShutdownInitiator::Endpoint as u8, Ordering::Relaxed);
+                        info!(
+                            "Address {} is no longer in DNS records, initiating graceful shutdown.",
+                            addr
+                        );
+                        info.shutdown_initiator
+                            .store(ShutdownInitiator::Endpoint as u8, Ordering::Relaxed);
                         info.shutdown_signal.notify_one();
                     }
                 }
@@ -1484,7 +1513,10 @@ impl HubConnectionManager {
         // 2. Clean up any maintenance tasks that have fully completed (either by error or shutdown).
         maintenance_task_handles.retain(|addr, (handle, _)| {
             if handle.is_finished() {
-                info!("Connection task for {} has finished. It will be removed.", addr);
+                info!(
+                    "Connection task for {} has finished. It will be removed.",
+                    addr
+                );
                 false
             } else {
                 true
@@ -1496,25 +1528,30 @@ impl HubConnectionManager {
         let conns_guard = hub_connections.read().await;
         let mut shutting_down_addrs = Vec::new();
         for addr in maintenance_task_handles.keys() {
-            if latest_addrs.contains(addr) {
-                if let Some(info) = conns_guard.get(addr) {
-                    if info.hub_status.load(Ordering::Relaxed) == HubStatus::ShuttingDown as u8 {
-                        shutting_down_addrs.push(*addr);
-                    }
-                }
+            if latest_addrs.contains(addr)
+                && let Some(info) = conns_guard.get(addr)
+                && info.hub_status.load(Ordering::Relaxed) == HubStatus::ShuttingDown as u8
+            {
+                shutting_down_addrs.push(*addr);
             }
         }
         drop(conns_guard);
 
         for addr in shutting_down_addrs {
-            info!("Connection to {} is shutting down but is in DNS. Detaching old task and starting a new one.", addr);
+            info!(
+                "Connection to {} is shutting down but is in DNS. Detaching old task and starting a new one.",
+                addr
+            );
             maintenance_task_handles.remove(&addr); // Detach. The task continues to run/drain until finished.
         }
 
         // 3. Start new tasks for IPs that are in DNS but have no running task.
         let current_task_addrs: HashSet<_> = maintenance_task_handles.keys().cloned().collect();
         for addr_to_add in latest_addrs.difference(&current_task_addrs) {
-            info!("New address {} found in DNS, starting a new connection manager task.", addr_to_add);
+            info!(
+                "New address {} found in DNS, starting a new connection manager task.",
+                addr_to_add
+            );
             let endpoint_clone = endpoint.clone();
             let server_name_clone = server_name.to_string();
             let stream_handler_clone = stream_handler.clone();
@@ -1547,10 +1584,10 @@ impl HubConnection {
         connection_id: usize,
     ) -> Option<HubConnection> {
         let mut guard = hub_connections.write().await;
-        if let std::collections::hash_map::Entry::Occupied(entry) = guard.entry(addr) {
-            if entry.get().connection.stable_id() == connection_id {
-                return Some(entry.remove());
-            }
+        if let std::collections::hash_map::Entry::Occupied(entry) = guard.entry(addr)
+            && entry.get().connection.stable_id() == connection_id
+        {
+            return Some(entry.remove());
         }
         None
     }
@@ -1565,43 +1602,35 @@ impl HubConnection {
         provider_start_sent: Arc<AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            loop {
-                match connection.read_datagram().await {
-                    Ok(bytes) => {
-                        let msg = bytes.as_ref();
-                        if msg == b"notify_shutdown" {
-                            info!(
-                                "Received notify_shutdown from Hub ({}). Marking connection as ShuttingDown.",
-                                addr
-                            );
-                            hub_status.store(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
-                            shutdown_initiator.store(ShutdownInitiator::Hub as u8, Ordering::Relaxed);
-                            // Trigger the main task's graceful shutdown logic via the shared channel.
-                            shutdown_signal.notify_one();
-                        } else if msg == b"notify_standby" {
-                            info!(
-                                "Received notify_standby from Hub ({}). Marking connection as StandBy.",
-                                addr
-                            );
-                            hub_status.store(HubStatus::StandBy as u8, Ordering::Relaxed);
-                        } else if msg == b"notify_active" {
-                            info!(
-                                "Received notify_active from Hub ({}). Marking connection as Active.",
-                                addr
-                            );
-                            hub_status.store(HubStatus::Active as u8, Ordering::Relaxed);
-                    } else if msg == b"notify_provider_stopped" {
-                        info!(
-                            "Received notify_provider_stopped from Hub ({}). Clearing provider_start_sent flag.",
-                            addr
-                        );
-                        provider_start_sent.store(false, Ordering::Relaxed);
-                        }
-                    }
-                    Err(_) => {
-                        // Connection closed or error, stop the handler.
-                        break;
-                    }
+            while let Ok(bytes) = connection.read_datagram().await {
+                let msg = bytes.as_ref();
+                if msg == b"notify_shutdown" {
+                    info!(
+                        "Received notify_shutdown from Hub ({}). Marking connection as ShuttingDown.",
+                        addr
+                    );
+                    hub_status.store(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
+                    shutdown_initiator.store(ShutdownInitiator::Hub as u8, Ordering::Relaxed);
+                    // Trigger the main task's graceful shutdown logic via the shared channel.
+                    shutdown_signal.notify_one();
+                } else if msg == b"notify_standby" {
+                    info!(
+                        "Received notify_standby from Hub ({}). Marking connection as StandBy.",
+                        addr
+                    );
+                    hub_status.store(HubStatus::StandBy as u8, Ordering::Relaxed);
+                } else if msg == b"notify_active" {
+                    info!(
+                        "Received notify_active from Hub ({}). Marking connection as Active.",
+                        addr
+                    );
+                    hub_status.store(HubStatus::Active as u8, Ordering::Relaxed);
+                } else if msg == b"notify_provider_stopped" {
+                    info!(
+                        "Received notify_provider_stopped from Hub ({}). Clearing provider_start_sent flag.",
+                        addr
+                    );
+                    provider_start_sent.store(false, Ordering::Relaxed);
                 }
             }
         })
@@ -1922,19 +1951,19 @@ impl Default for ProxyRetryConfig {
 #[derive(Debug)]
 enum ProxyError {
     /// An error occurred on the QUIC stream during a read operation.
-    QuicStreamReadError {
+    QuicStreamRead {
         error: quinn::ReadError,
         /// A tuple containing bytes transferred: (tcp_read, tcp_written, quic_read, quic_written)
         bytes: (u64, u64, u64, u64),
     },
     /// An error occurred on the QUIC stream during a write operation.
-    QuicStreamWriteError {
+    QuicStreamWrite {
         error: quinn::WriteError,
         /// A tuple containing bytes transferred: (tcp_read, tcp_written, quic_read, quic_written)
         bytes: (u64, u64, u64, u64),
     },
     /// An error occurred on the local TCP stream, which is generally non-recoverable.
-    TcpStreamError {
+    TcpStream {
         error: std::io::Error,
         /// A tuple containing bytes transferred: (tcp_read, tcp_written, quic_read, quic_written)
         bytes: (u64, u64, u64, u64),

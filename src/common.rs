@@ -61,18 +61,35 @@ pub fn load_certs_and_key(
     Box<dyn Error>,
 > {
     let certs = CertificateDer::pem_file_iter(my_cert_path)
-        .map_err(|e| format!("Failed to read certificate file at '{}': {}", my_cert_path, e))?
-        .map(|cert_result| cert_result.map_err(|e| format!("Failed to parse certificate in '{}': {}", my_cert_path, e).into()))
+        .map_err(|e| {
+            format!(
+                "Failed to read certificate file at '{}': {}",
+                my_cert_path, e
+            )
+        })?
+        .map(|cert_result| {
+            cert_result.map_err(|e| {
+                format!("Failed to parse certificate in '{}': {}", my_cert_path, e).into()
+            })
+        })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
 
     let key = PrivateKeyDer::from_pem_file(my_key_path)
         .map_err(|e| format!("Failed to load private key from '{}': {}", my_key_path, e))?;
 
     let mut truststore = quinn::rustls::RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter(trust_ca_cert_path)
-        .map_err(|e| format!("Failed to read trust store file at '{}': {}", trust_ca_cert_path, e))?
-    {
-        truststore.add(cert.map_err(|e| format!("Failed to parse CA certificate in '{}': {}", trust_ca_cert_path, e))?)?;
+    for cert in CertificateDer::pem_file_iter(trust_ca_cert_path).map_err(|e| {
+        format!(
+            "Failed to read trust store file at '{}': {}",
+            trust_ca_cert_path, e
+        )
+    })? {
+        truststore.add(cert.map_err(|e| {
+            format!(
+                "Failed to parse CA certificate in '{}': {}",
+                trust_ca_cert_path, e
+            )
+        })?)?;
     }
 
     Ok((certs, key, truststore))
@@ -146,30 +163,30 @@ pub async fn check_and_get_info_connection(
 
     // certificate
     if let Some(identity) = connection.peer_identity() {
-        if let Some(certs) = identity.downcast_ref::<Vec<CertificateDer<'static>>>() {
-            if let Some(client_cert) = certs.first() {
-                if let Ok((_, parsed_cert)) = parse_x509_certificate(client_cert.as_ref()) {
-                    info!("  - Subject: {}", parsed_cert.subject());
-                    info!("  - Issuer:  {}", parsed_cert.issuer());
-                    info!("  - Serial:  {}", parsed_cert.serial);
+        if let Some(certs) = identity.downcast_ref::<Vec<CertificateDer<'static>>>()
+            && let Some(client_cert) = certs.first()
+        {
+            if let Ok((_, parsed_cert)) = parse_x509_certificate(client_cert.as_ref()) {
+                info!("  - Subject: {}", parsed_cert.subject());
+                info!("  - Issuer:  {}", parsed_cert.issuer());
+                info!("  - Serial:  {}", parsed_cert.serial);
 
-                    // CN (Common Name)
-                    cn = parsed_cert
-                        .subject()
-                        .iter()
-                        .flat_map(|rdn| rdn.iter())
-                        .find(|attr| attr.attr_type() == &OID_X509_COMMON_NAME)
-                        .and_then(|attr| attr.attr_value().as_str().ok())
-                        .map(String::from);
+                // CN (Common Name)
+                cn = parsed_cert
+                    .subject()
+                    .iter()
+                    .flat_map(|rdn| rdn.iter())
+                    .find(|attr| attr.attr_type() == &OID_X509_COMMON_NAME)
+                    .and_then(|attr| attr.attr_value().as_str().ok())
+                    .map(String::from);
 
-                    if let Some(cn_val) = &cn {
-                        info!("  - CN:      {}", cn_val);
-                    } else {
-                        info!("  - CN:      Not found");
-                    }
+                if let Some(cn_val) = &cn {
+                    info!("  - CN:      {}", cn_val);
                 } else {
-                    error!("Failed to parse client certificate.");
+                    info!("  - CN:      Not found");
                 }
+            } else {
+                error!("Failed to parse client certificate.");
             }
         }
     } else {
