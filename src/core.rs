@@ -90,6 +90,16 @@ impl Drop for SpnEndpoint {
         // This performs a forceful shutdown. Unlike the `run_client_*` functions,
         // we cannot await graceful draining here because `Drop` is synchronous.
 
+        // Try to send a shutdown datagram to the Hub on a best-effort basis before closing.
+        if let Ok(conns_guard) = self.hub_connections.try_read() {
+            for info in conns_guard.values() {
+                let prev = info.hub_status.swap(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
+                if prev != HubStatus::ShuttingDown as u8 {
+                    let _ = info.connection.send_datagram(b"notify_shutdown".to_vec().into());
+                }
+            }
+        }
+
         // Abort the main maintenance task itself as a final measure.
         self.hub_connections_maintenance_task.abort();
 
@@ -528,9 +538,11 @@ pub async fn run_client_consumer(
     tcp_listener_task.abort();
     activity_monitor_task.abort();
 
-    // Perform graceful shutdown of QUIC connections.
+    // Perform shutdown of QUIC connections.
     if graceful {
         HubConnectionManager::graceful_shutdown_all(hub_connections).await;
+    } else {
+        HubConnectionManager::immediate_shutdown_all(hub_connections).await;
     }
 
     endpoint.close(0u32.into(), b"shutting down");
@@ -629,13 +641,15 @@ pub async fn run_client_provider(
     // --- Final Cleanup ---
     info!("Executing final cleanup...");
 
-    // Abort background tasks.
+    // Abort background tasks immediately to prevent new connections.
     hub_connections_maintenance_task.abort();
     activity_monitor_task.abort();
 
-    // Perform graceful shutdown of QUIC connections.
+    // Perform shutdown of QUIC connections.
     if graceful {
         HubConnectionManager::graceful_shutdown_all(hub_connections).await;
+    } else {
+        HubConnectionManager::immediate_shutdown_all(hub_connections).await;
     }
 
     endpoint.close(0u32.into(), b"shutting down");
@@ -1370,6 +1384,28 @@ impl HubConnectionManager {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    /// Immediately notifies all active connections of shutdown without waiting for streams to drain.
+    async fn immediate_shutdown_all(
+        hub_connections: Arc<RwLock<HashMap<SocketAddr, HubConnection>>>,
+    ) {
+        info!("Initiating immediate shutdown notification for all active connections...");
+        let conns_guard = hub_connections.read().await;
+        for (addr, info) in conns_guard.iter() {
+            let prev_status = info.hub_status.swap(HubStatus::ShuttingDown as u8, Ordering::Relaxed);
+            if prev_status != HubStatus::ShuttingDown as u8 {
+                if let Err(e) = info.connection.send_datagram(b"notify_shutdown".to_vec().into()) {
+                    trace!("Failed to send immediate notify_shutdown datagram to {}: {}", addr, e);
+                } else {
+                    trace!("Sent immediate notify_shutdown datagram to {}", addr);
+                }
+            }
+        }
+        drop(conns_guard);
+        
+        // Yield to the runtime to allow underlying I/O tasks a chance to flush the datagrams before endpoint closing.
+        tokio::task::yield_now().await;
     }
 
     /// A background task that periodically checks all active connections for data activity.
